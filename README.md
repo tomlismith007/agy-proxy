@@ -4,22 +4,41 @@
 **OpenAI 兼容**（`/v1/chat/completions`）与 **Anthropic 兼容**（`/v1/messages`）两种接口，
 供 Claude Code CLI、Cherry Studio、OpenAI SDK 等任意客户端直接接入。
 
+**全程网页操作**：打开浏览器管理台即可完成 OAuth 登录、创建/管理 API Key、查看 token 用量与请求日志——
+不需要敲一行命令。
+
 > ⚠️ **免责声明**
 > 本工具通过复用 Antigravity 桌面版的公开 OAuth 客户端访问 Google Cloud Code 接口，
 > 该用法可能违反 Antigravity 的服务条款，存在限流、封禁等风险。
 > 本项目仅供个人在本地环境学习研究网络协议之用，请自行承担使用风险，
 > 并遵守当地法律法规与上游服务条款。作者不对账号损失承担责任。
 
+## Web 管理台（主推）
+
+网关启动后打开 `http://127.0.0.1:8045/`（地址随 host/port 配置），所有日常操作都在网页完成：
+
+- **网页端 OAuth 登录**：在「账号池」页点击登录，浏览器拉起 Google OAuth 授权（PKCE），
+  回调自动接收、状态实时轮询，成功后账号直接入池；无浏览器环境时切换粘贴模式，复制回调 URL 即可。
+  支持多账号连续登录，凭据 AES-256-GCM 加密落盘。
+- **网页端创建密钥**：在「接入密钥」页一键创建命名 API Key（可建多把、按需删除），或轮换主密钥；
+  新建密钥仅在回环访问下完整展示一次，之后界面只显示脱敏尾号。
+- **token 用量**：在「请求统计」页查看实时累计（请求数 / 成功失败 / 三类 token）与**按天持久化的用量历史**——
+  按协议、模型、账号、小时分布聚合，可展开任意单日的完整明细；数据重启不丢，保留天数可配置。
+- **请求日志**：同页提供最近请求的实时流水（时间、协议、模型、服务账号、状态码、耗时、是否流式、
+  prompt/output/thoughts token 数与错误信息），每条请求来了什么、走了哪个号、花了多少 token 一目了然。
+- **账号池管理**：账号卡片展示配额条与状态，网页上即可启停、验证、绑定/测试每账号专属出站代理、
+  批量导入导出。
+- **模型目录**：真实发现账号可用模型与剩余配额，支持控制台内直接试聊（test chat）。
+- **服务概览 / 网关设置 / 接入指南**：运行状态与用量速览；debugLog、并发、别名、kill-switch 等配置
+  页面上改即热生效；内置客户端接入指南。
+
 ## 功能
 
-- **Google OAuth 登录**：浏览器回调（默认端口 51121）+ 无头粘贴模式；PKCE；token 过期前 5 分钟主动刷新
-  （并发请求 single-flight 去重；`invalid_grant` 二次确认后才停号）。凭据 AES-256-GCM 加密落盘，
-  主密钥分离存放于 `~/.agy-proxy/.credentials.yaml`。
-- **模型发现**：`GET /v1/models` 返回账号真实可用模型与剩余配额；发现失败时回退内置目录。
 - **双协议兼容**：
   - OpenAI `/v1/chat/completions`：流式 SSE + 非流式，支持 tool_calls、图片输入、`reasoning_content`
   - Anthropic `/v1/messages`：严格事件流生命周期，thinking 块、tool_use/tool_result、thought_signature 回放
   - Anthropic `/v1/messages/count_tokens`：上游计数透传
+- **模型发现**：`GET /v1/models` 返回账号真实可用模型与剩余配额；发现失败时回退内置目录。
 - **账号池与轮换**：429 四分类引擎（soft/rate_limited/quota_exhausted/unknown）、按服务端真实重置时间冷却
   （+1.5s grace）、用量感知选号、10 分钟会话亲和（同对话钉同一账号保缓存）、403 `VALIDATION_REQUIRED`
   温和处理（自愈冷却 + validation_url 展示）。
@@ -32,12 +51,9 @@
 - **风控姿态控制**：per-account 稳定设备指纹（版本池可从官方 release feed 自动保鲜，也可经
   `fingerprint.json` 手动覆盖）、全局上游并发信号量（默认 2）、全局最小调用间隔（默认 300ms，
   `AGY_MIN_INTERVAL_MS` 可调）、紧急 kill-switch（`agy-proxy pause/resume` 或 config `killSwitch`）。
-- **Web 管理台**（`http://127.0.0.1:8045/`）：服务概览、账号卡片与配额条、Web 登录向导、模型测试、
-  请求统计（实时）与每日用量历史（持久化）、配置热加载、API Key 轮换、导入导出。
 - **用量历史（按天持久化）**：每次请求的 token 用量与成功/失败按本地时区聚合写入
-  `<dataDir>/usage/YYYY-MM-DD.json`（内存累计 + 去抖原子落盘，重启不丢），含按协议/模型/账号/小时分布；
-  管理台「请求统计」页可查每日用量并展开单日明细，CLI `agy-proxy usage` 亦可查阅。
-  流式请求会在流收尾时补记 usage 帧 token 数；`usageRetentionDays` 可设置保留天数（默认永久）。
+  `<dataDir>/usage/YYYY-MM-DD.json`（内存累计 + 去抖原子落盘，重启不丢）；流式请求在流收尾时补记
+  usage 帧 token 数；`usageRetentionDays` 可设置保留天数（默认永久）。
 
 ## 快速开始
 
@@ -47,19 +63,22 @@
 cd agy-proxy
 npm install
 npm run build          # tsc + admin-ui + 静态资源拷贝
-
-# 登录（推荐先注入 Antigravity 桌面版公开 client_secret，见下方说明）
-node dist/index.js login            # 浏览器模式
-node dist/index.js login --headless # 无浏览器环境：打印 URL 后粘贴回调
-
-# 启动网关（或直接双击 start.cmd）
-node dist/index.js serve
+node dist/index.js serve   # 启动网关（或直接双击 start.cmd）
 ```
 
-启动后：
+然后全部在浏览器完成：
+
+1. 打开 **`http://127.0.0.1:8045/`**
+2. 「账号池」→ **登录账号**：浏览器完成 Google OAuth 授权，账号自动入池（可连续添加多个）
+3. 「接入密钥」→ **创建 API Key**，复制备用
+4. 任意客户端接入（下方示例），「请求统计」页实时查看 token 用量与请求日志
+
+CLI 登录仍可用作替代：`node dist/index.js login`（浏览器模式）或 `login --headless`（粘贴回调）。
+
+### 客户端接入
 
 ```bash
-KEY=$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.env.USERPROFILE+'/.agy-proxy/config.json','utf8')).apiKey)")
+KEY=你创建的API密钥
 
 curl http://127.0.0.1:8045/healthz
 curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8045/v1/models
@@ -105,7 +124,7 @@ modelAliases/proxy/maxConcurrentUpstream/onlyRealModels/killSwitch/usageRetentio
 ## CLI
 
 ```
-agy-proxy login [--headless] [--port]   # 登录
+agy-proxy login [--headless] [--port]   # 登录（网页端登录的命令行替代）
 agy-proxy status                        # 账号状态
 agy-proxy models [email]                # 可用模型与配额
 agy-proxy verify [email]                # 强制校验凭据/project（等同一次手动健康探测）
