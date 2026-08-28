@@ -9,6 +9,7 @@ import { AGY_ENDPOINT_FALLBACKS, postAcrossEndpoints } from './endpoints.js'
 import { getBootstrapUserAgent, getClientMetadataHeader, getGenerationUserAgent, getXGoogApiClient } from './fingerprint.js'
 import { classifyFetchError, classifyHttpError, ClassifiedUpstreamError } from '../pool/classify.js'
 import { safeFetch } from '../util/urlguard.js'
+import { unwrapResponseEnvelope } from '../adapters/shared/frame.js'
 import { createLogger } from '../util/log.js'
 import type { DiscoveredModels } from '../types.js'
 import type { Envelope, UpstreamResponse } from '../types.js'
@@ -24,6 +25,8 @@ export interface UpstreamIdentity {
   accessToken: string
   /** Account email / stable key: seeds fingerprint + session identity. */
   accountKey: string
+  /** Per-account egress proxy binding; forwarded as safeFetch agyProxy. */
+  proxyUrl?: string
 }
 
 function generationHeaders(identity: UpstreamIdentity, stream: boolean): Record<string, string> {
@@ -44,17 +47,21 @@ async function readBodyText(response: Response): Promise<string | undefined> {
   }
 }
 
-/** Throw the classified error for a failed response; resolve with body text otherwise. */
-async function assertOkOrClassify(response: Response, baseEndpoint: string): Promise<string | undefined> {
-  if (response.ok) return readBodyText(response)
+/**
+ * Throw the classified error for a failed response; resolve otherwise WITHOUT
+ * touching the body — reading it would lock the stream and break the SSE path.
+ */
+async function assertOkOrClassify(response: Response, baseEndpoint: string): Promise<void> {
+  if (response.ok) return
   const bodyText = await readBodyText(response)
   const classified = classifyHttpError(response.status, response.headers, bodyText)
   log.debug(`${response.status} at ${baseEndpoint}: ${classified.kind}${classified.rateLimitCategory ? `/${classified.rateLimitCategory}` : ''}`)
   throw new ClassifiedUpstreamError(classified)
 }
 
-export function parseUpstreamJson(bodyText: string): UpstreamResponse {
-  return JSON.parse(bodyText) as UpstreamResponse
+function parseUpstreamJson(bodyText: string): UpstreamResponse {
+  // The upstream wraps the generation payload in a top-level `response` envelope.
+  return unwrapResponseEnvelope(JSON.parse(bodyText) as UpstreamResponse)
 }
 
 /** Non-streaming generation across fallback endpoints. */
@@ -70,8 +77,10 @@ export async function generateContent(
       () => ({ method: 'POST', headers: generationHeaders(identity, false), body }),
       GENERATE_TIMEOUT_MS,
       options.signal,
+      { proxyUrl: identity.proxyUrl },
     )
-    const text = await assertOkOrClassify(attempt.response, attempt.baseEndpoint)
+    await assertOkOrClassify(attempt.response, attempt.baseEndpoint)
+    const text = await readBodyText(attempt.response)
     return parseUpstreamJson(text ?? '{}')
   } catch (error) {
     if (error instanceof ClassifiedUpstreamError) throw error
@@ -82,8 +91,7 @@ export async function generateContent(
 /**
  * Streaming generation: returns the raw Response (caller consumes the SSE
  * body). Non-ok statuses are classified and thrown before any streaming.
- */
-export async function beginStreamGenerateContent(
+ */export async function beginStreamGenerateContent(
   identity: UpstreamIdentity,
   envelope: Envelope,
   options: { signal?: AbortSignal } = {},
@@ -95,6 +103,7 @@ export async function beginStreamGenerateContent(
       () => ({ method: 'POST', headers: generationHeaders(identity, true), body }),
       STREAM_TIMEOUT_MS,
       options.signal,
+      { proxyUrl: identity.proxyUrl },
     )
     await assertOkOrClassify(attempt.response, attempt.baseEndpoint)
     if (!attempt.response.body) {
@@ -105,6 +114,42 @@ export async function beginStreamGenerateContent(
       events: parseSseStream(attempt.response.body),
       baseEndpoint: attempt.baseEndpoint,
     }
+  } catch (error) {
+    if (error instanceof ClassifiedUpstreamError) throw error
+    throw new ClassifiedUpstreamError(classifyFetchError(error))
+  }
+}
+
+/**
+ * Upstream token counting for /v1/messages/count_tokens. Same envelope shape
+ * as generation minus generationConfig (counting is not a generation call).
+ * Returns the reported total token count.
+ */
+export async function countUpstreamTokens(
+  identity: UpstreamIdentity,
+  envelope: Envelope,
+  options: { signal?: AbortSignal } = {},
+): Promise<number> {
+  const body = JSON.stringify({
+    ...envelope,
+    request: { ...envelope.request, generationConfig: undefined },
+  })
+  try {
+    const attempt = await postAcrossEndpoints(
+      '/v1internal:countTokens',
+      () => ({ method: 'POST', headers: generationHeaders(identity, false), body }),
+      GENERATE_TIMEOUT_MS,
+      options.signal,
+      { proxyUrl: identity.proxyUrl },
+    )
+    await assertOkOrClassify(attempt.response, attempt.baseEndpoint)
+    const raw = JSON.parse((await readBodyText(attempt.response)) ?? '{}') as Record<string, unknown>
+    const inner = unwrapResponseEnvelope(raw) as { totalTokens?: unknown }
+    const total = Number(inner?.totalTokens)
+    if (!Number.isFinite(total)) {
+      throw new ClassifiedUpstreamError({ kind: 'transient', message: 'upstream count response missing totalTokens' })
+    }
+    return total
   } catch (error) {
     if (error instanceof ClassifiedUpstreamError) throw error
     throw new ClassifiedUpstreamError(classifyFetchError(error))
@@ -131,6 +176,7 @@ export async function fetchAvailableModels(
         headers,
         body,
         signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
+        ...(identity.proxyUrl ? { agyProxy: identity.proxyUrl } : {}),
       })
       if (response.ok) {
         return (await response.json()) as DiscoveredModels

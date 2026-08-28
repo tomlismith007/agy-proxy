@@ -1,84 +1,34 @@
 /**
- * Hono app wiring: health/info, authenticated /v1/* surface (models, OpenAI
- * chat, Anthropic messages), CORS + logging + API key middleware.
+ * Hono app wiring: health/info, admin console (page + JSON API), and the
+ * authenticated /v1/* surface (models, OpenAI chat, Anthropic messages) behind
+ * CORS + logging + API key middleware.
  */
 
 import { Hono } from 'hono'
 import { serve, type ServerType } from '@hono/node-server'
-import { AGY_PUBLIC_MODELS } from './upstream/catalog.js'
-import { fetchAvailableModels } from './upstream/client.js'
-import { isChatCallableModelId, catalogModel } from './upstream/catalog.js'
-import { ensureFreshAccessToken } from './auth/tokens.js'
+import { apiKeyAuth, corsMiddleware, killSwitchMiddleware, requestLogging } from './api/middleware.js'
+import { handleChatRequest, handleCountTokensRequest, type AppContext } from './api/chat-handler.js'
 import { OPENAI_FORMAT } from './adapters/openai/format.js'
 import { ANTHROPIC_FORMAT } from './adapters/anthropic/format.js'
-import type { DiscoveredModels, DiscoveredModelEntry } from './types.js'
-import { apiKeyAuth, corsMiddleware, requestLogging } from './api/middleware.js'
-import { handleChatRequest, type AppContext } from './api/chat-handler.js'
+import { Semaphore } from './util/concurrency.js'
+import { discoverModels, modelEntry } from './upstream/discovery.js'
+import { startQuotaRefresher, type QuotaRefresher } from './pool/quota-refresher.js'
+import { startVersionRefreshLoop, type VersionRefresher } from './upstream/fingerprint.js'
+import { startHealthLoop, type HealthLoop } from './pool/health.js'
+import { stats } from './util/stats.js'
+import { UsageHistory } from './util/usage-history.js'
+import { createLogger } from './util/log.js'
 import type { AppConfig } from './config.js'
 import type { AccountStore } from './auth/store.js'
-import { createLogger } from './util/log.js'
+import { isLoopbackHost, registerAdminPage } from './admin/page.js'
+import { registerAdminRoutes } from './admin/api.js'
+import { VERSION } from './version.js'
 
 const log = createLogger('server')
-
-const PROXY_VERSION = '0.1.0'
 
 export interface RunningServer {
   port: number
   close(): Promise<void>
-}
-
-/** In-memory model-id cache per account (TTL below). */
-const MODEL_CACHE_TTL_MS = 5 * 60 * 1000
-const modelIdCache = new Map<string, { ids: string[]; updatedAt: number }>()
-
-async function discoverModelEntries(
-  ctx: AppContext,
-): Promise<{ ids: string[]; source: 'discovered' | 'catalog' }> {
-  const accounts = ctx.store
-    .list()
-    .filter((r) => r.enabled)
-    .sort((a, b) => (b.cachedQuotaUpdatedAt ?? 0) - (a.cachedQuotaUpdatedAt ?? 0))
-
-  for (const record of accounts) {
-    const cached = modelIdCache.get(record.email)
-    if (cached && Date.now() - cached.updatedAt < MODEL_CACHE_TTL_MS) {
-      return { ids: cached.ids, source: 'discovered' }
-    }
-    try {
-      const accessToken = await ensureFreshAccessToken(ctx.store, record.email)
-      const discovered: DiscoveredModels = await fetchAvailableModels(
-        { accessToken, accountKey: record.email },
-        record.projectId,
-      )
-      const ids = Object.keys(discovered.models ?? {}).filter((id) => isChatCallableModelId(id))
-      if (ids.length > 0) {
-        modelIdCache.set(record.email, { ids, updatedAt: Date.now() })
-        return { ids, source: 'discovered' }
-      }
-    } catch (error) {
-      log.warn(
-        `model discovery failed for ${record.email}: ${error instanceof Error ? error.message : String(error)}; trying next account`,
-      )
-    }
-  }
-  return { ids: AGY_PUBLIC_MODELS.map((m) => m.id), source: 'catalog' }
-}
-
-function modelEntry(id: string, discovered?: Map<string, DiscoveredModelEntry>): Record<string, unknown> {
-  const meta = catalogModel(id)
-  const dynamic = discovered?.get(id)
-  return {
-    id,
-    object: 'model',
-    type: 'model',
-    created: Math.floor(Date.now() / 1000),
-    owned_by: 'antigravity',
-    display_name: dynamic?.displayName ?? meta?.name ?? id,
-    ...(meta ? { context_length: meta.contextLength, max_output_tokens: meta.maxOutputTokens } : {}),
-    supports_reasoning: meta?.supportsReasoning ?? true,
-    supports_vision: meta?.supportsVision ?? true,
-    tool_calling: meta?.toolCalling ?? true,
-  }
 }
 
 export function createApp(ctx: AppContext): Hono {
@@ -93,35 +43,40 @@ export function createApp(ctx: AppContext): Hono {
   app.get('/healthz', (c) =>
     c.json({
       ok: true,
-      version: PROXY_VERSION,
+      version: VERSION,
       uptimeSeconds: Math.floor(process.uptime()),
       accounts: ctx.store.list().length,
     }),
   )
 
-  app.get('/', (c) =>
-    c.json({
-      name: 'agy-proxy',
-      version: PROXY_VERSION,
-      endpoints: ['/v1/models', '/v1/chat/completions (OpenAI)', '/v1/messages (Anthropic)', '/healthz'],
-    }),
-  )
+  // Admin console page (shell + assets) and its JSON API. Reads are open on a
+  // loopback listener; writes are guarded (Origin check + optional token).
+  registerAdminPage(app)
+  registerAdminRoutes(app, ctx)
 
   // Authenticated API surface.
-  app.use('/v1/*', apiKeyAuth(ctx.config.apiKey), requestLogging())
+  app.use(
+    '/v1/*',
+    killSwitchMiddleware(ctx.config.dataDir),
+    apiKeyAuth(() => [ctx.config.apiKey, ...Object.values(ctx.config.apiKeys)]),
+    requestLogging(),
+  )
 
   app.get('/v1/models', async (c) => {
     try {
-      const { ids, source } = await discoverModelEntries(ctx)
-      let entries = ids
+      const { ids, source, entries } = await discoverModels(ctx)
+      let list = ids
       if (!ctx.config.onlyRealModels && ctx.config.modelAliases) {
-        entries = [...ids]
+        list = [...ids]
         for (const alias of Object.keys(ctx.config.modelAliases)) {
-          if (!entries.includes(alias)) entries.push(alias)
+          if (!list.includes(alias)) list.push(alias)
         }
       }
-      const data = entries.map((id) => modelEntry(id))
-      return c.json({ object: 'list', data, x_source: source })
+      return c.json({
+        object: 'list',
+        data: list.map((id) => modelEntry(id, entries)),
+        x_source: source,
+      })
     } catch (error) {
       log.error(`models listing failed: ${error instanceof Error ? error.message : String(error)}`)
       return c.json({ object: 'list', data: [] })
@@ -130,6 +85,8 @@ export function createApp(ctx: AppContext): Hono {
 
   app.post('/v1/chat/completions', (c) => handleChatRequest(ctx, c, OPENAI_FORMAT))
   app.post('/v1/messages', (c) => handleChatRequest(ctx, c, ANTHROPIC_FORMAT))
+  // Anthropic SDK / Claude Code preflight counting (no OpenAI equivalent).
+  app.post('/v1/messages/count_tokens', (c) => handleCountTokensRequest(ctx, c))
 
   return app
 }
@@ -137,11 +94,30 @@ export function createApp(ctx: AppContext): Hono {
 /** Start the HTTP listener. Resolves once bound. */
 export function startServer(config: AppConfig, store: AccountStore): Promise<RunningServer> {
   return new Promise((resolve, reject) => {
-    const app = createApp({ config, store })
+    // Persistent per-day usage history; live stats forward every request into
+    // it so daily token/request totals survive restarts.
+    const usageHistory = new UsageHistory(config.dataDir, { retentionDays: config.usageRetentionDays })
+    stats.attachHistory(usageHistory)
+    const ctx: AppContext = {
+      config,
+      store,
+      upstreamGate: new Semaphore(config.maxConcurrentUpstream),
+      usage: usageHistory,
+    }
+    const app = createApp(ctx)
+    // Keeps cached family quotas fresh so usage-aware selection has data
+    // without manual admin-panel refreshes; keeps the fingerprint version
+    // pool tracking the real Antigravity release feed.
+    const quotaRefresher: QuotaRefresher = startQuotaRefresher(ctx)
+    const versionRefresher: VersionRefresher = startVersionRefreshLoop()
+    const healthLoop: HealthLoop = startHealthLoop(store)
     let server: ServerType
     try {
       server = serve({ fetch: app.fetch, hostname: config.host, port: config.port })
     } catch (error) {
+      quotaRefresher.stop()
+      versionRefresher.stop()
+      healthLoop.stop()
       reject(error)
       return
     }
@@ -149,6 +125,10 @@ export function startServer(config: AppConfig, store: AccountStore): Promise<Run
 
     const close = (): Promise<void> =>
       new Promise((resolveClose) => {
+        quotaRefresher.stop()
+        versionRefresher.stop()
+        healthLoop.stop()
+        usageHistory.flush()
         server.close(() => resolveClose())
       })
 

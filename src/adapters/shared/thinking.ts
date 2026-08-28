@@ -27,8 +27,3 @@ export function signatureForCall(callId: string | undefined): string {
   if (!callId) return THOUGHT_SIGNATURE_SENTINEL
   return cache.get(callId) ?? THOUGHT_SIGNATURE_SENTINEL
 }
-
-/** Test-only: drop every cached signature. */
-export function clearSignatureCache(): void {
-  cache.clear()
-}

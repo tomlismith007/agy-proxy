@@ -145,11 +145,27 @@ export function sanitizeTools(
     if (typeof tool.name !== 'string' || tool.name.length === 0) continue
     if (BUILTIN_TOOL_NAMES.has(tool.name)) continue
     const safeName = sanitizeToolName(tool.name, used)
-    const schema = sanitizeNode(tool.parameters ?? tool.input_schema)
+    let rawSchema: unknown = tool.parameters ?? tool.input_schema
+    // AI-SDK style wrapper `{jsonSchema: {...}}` — unwrap to the real schema
+    // so the parameter shape survives instead of sanitizing away to nothing.
+    if (rawSchema && typeof rawSchema === 'object' && !Array.isArray(rawSchema)) {
+      const record = rawSchema as Record<string, unknown>
+      if (
+        record.jsonSchema !== undefined &&
+        typeof record.jsonSchema === 'object' &&
+        record.jsonSchema !== null &&
+        !Array.isArray(record.jsonSchema)
+      ) {
+        rawSchema = record.jsonSchema
+      }
+    }
+    const schema = sanitizeNode(rawSchema)
     declarations.push({
       name: safeName,
       ...(typeof tool.description === 'string' ? { description: tool.description } : {}),
-      ...(schema && Object.keys(schema).length > 0 ? { parameters: schema } : {}),
+      // The Claude-family upstream hard-400s a declaration without
+      // parameters (Gemini tolerates it) — always emit the empty-object floor.
+      parameters: schema && Object.keys(schema).length > 0 ? schema : { type: 'object', properties: {} },
     })
     nameMap.set(safeName, tool.name)
   }
@@ -161,19 +177,4 @@ export function sanitizeTools(
 export function originalToolName(nameMap: Map<string, string>, upstreamName: string | undefined): string {
   if (!upstreamName) return 'unknown_tool'
   return nameMap.get(upstreamName) ?? upstreamName
-}
-
-/** Parse OpenAI `arguments` JSON strings defensively. */
-export function parseArgumentsJson(raw: unknown): Record<string, unknown> {
-  if (raw === undefined || raw === null) return {}
-  if (typeof raw === 'object') return raw as Record<string, unknown>
-  if (typeof raw !== 'string' || raw.trim() === '') return {}
-  try {
-    const parsed = JSON.parse(raw) as unknown
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : { value: parsed }
-  } catch {
-    throw new ApiError(400, 'invalid_request_error', 'tool call arguments are not valid JSON')
-  }
 }

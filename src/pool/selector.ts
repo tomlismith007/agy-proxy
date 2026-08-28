@@ -10,6 +10,14 @@ import { familyKeyOf, familyQuotaFor, isFamilyDrained } from './quota.js'
 
 const HOT_FRACTION = 0.85
 
+/**
+ * Requests stay blocked this long AFTER a server-reported reset instant:
+ * landing exactly at the boundary still trips a stale limiter shard upstream
+ * and would burn another 429 + cooldown cycle (Antigravity-Manager uses the
+ * same +1500ms grace).
+ */
+export const RESET_GRACE_MS = 1_500
+
 export interface PoolCandidate {
   record: AccountRecord
   /** Cooldown wall blocking this account (null when usable now). */
@@ -26,12 +34,13 @@ interface Ranked extends PoolCandidate {
 
 function blockedUntilOf(record: AccountRecord, modelId: string | undefined, now: number): number | null {
   let blocked: number | null = null
-  if (record.coolingDownUntil && record.coolingDownUntil > now) {
-    blocked = record.coolingDownUntil
+  const bump = (until: number): number => until + RESET_GRACE_MS
+  if (record.coolingDownUntil && bump(record.coolingDownUntil) > now) {
+    blocked = bump(record.coolingDownUntil)
   }
   const familyLimit = record.rateLimitResetTimes?.[familyKeyOf(modelId)]
-  if (familyLimit !== undefined && familyLimit > now) {
-    blocked = blocked === null ? familyLimit : Math.max(blocked, familyLimit)
+  if (familyLimit !== undefined && bump(familyLimit) > now) {
+    blocked = blocked === null ? bump(familyLimit) : Math.max(blocked, bump(familyLimit))
   }
   // A measured zero-remaining family with a future reset blocks until that reset.
   if (blocked === null) {
@@ -39,7 +48,7 @@ function blockedUntilOf(record: AccountRecord, modelId: string | undefined, now:
     const remaining = quota?.remainingFraction
     if (quota && typeof remaining === 'number' && remaining <= 0 && quota.resetTime) {
       const resetMs = Date.parse(quota.resetTime)
-      if (!Number.isNaN(resetMs) && resetMs > now) blocked = resetMs
+      if (!Number.isNaN(resetMs) && bump(resetMs) > now) blocked = bump(resetMs)
     }
   }
   return blocked

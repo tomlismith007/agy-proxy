@@ -18,7 +18,8 @@
 
 import { promises as dns } from 'node:dns'
 import net from 'node:net'
-import { ProxyAgent } from 'undici'
+import { fetch as undiciFetch, ProxyAgent } from 'undici'
+import type { RequestInit as UndiciRequestInit } from 'undici'
 import { createLogger } from './log.js'
 
 const log = createLogger('urlguard')
@@ -234,18 +235,190 @@ function resolveProxyDispatcher(): ProxyAgent | undefined {
   return cachedAgent.agent
 }
 
+/** Well-known local HTTP proxy ports (Clash / Clash Verge / v2rayN). */
+const COMMON_LOCAL_PROXY_PORTS = [7890, 7897, 10809] as const
+
+/**
+ * Probe the well-known local proxy ports with a real request through each
+ * candidate; the first one that reaches a fast external endpoint wins.
+ * Deliberately bypasses safeFetch: the targets here are fixed local listeners,
+ * not arbitrary outbound URLs.
+ */
+async function detectLocalHttpProxy(timeoutMs = 2_500): Promise<string | undefined> {
+  for (const port of COMMON_LOCAL_PROXY_PORTS) {
+    const candidate = `http://127.0.0.1:${port}`
+    try {
+      const agent = new ProxyAgent(candidate)
+      const response = await undiciFetch('https://www.gstatic.com/generate_204', {
+        method: 'GET',
+        signal: AbortSignal.timeout(timeoutMs),
+        dispatcher: agent,
+      })
+      if (response.status === 204 || response.ok) return candidate
+    } catch {
+      // port closed / not an HTTP proxy / no upstream connectivity
+    }
+  }
+  return undefined
+}
+
+/**
+ * Resolve the egress proxy for this process: explicit env first, then the
+ * configured value, then well-known local ports. The winner is exported as
+ * AGY_PROXY_PROXY so every later safeFetch dispatches through it.
+ */
+export async function ensureEgressProxy(configured?: string): Promise<string | undefined> {
+  const existing = process.env.AGY_PROXY_PROXY?.trim()
+  if (existing) return existing
+  if (configured && configured.trim() !== '') {
+    process.env.AGY_PROXY_PROXY = configured.trim()
+    log.info(`using configured egress proxy ${configured.trim()}`)
+    return process.env.AGY_PROXY_PROXY
+  }
+  const detected = await detectLocalHttpProxy()
+  if (detected) {
+    process.env.AGY_PROXY_PROXY = detected
+    log.info(`auto-detected local proxy ${detected}; routing all egress through it`)
+    return detected
+  }
+  log.warn(
+    'no usable local proxy found and none configured; direct egress will likely fail behind a firewall. ' +
+      'Set AGY_PROXY_PROXY (e.g. http://127.0.0.1:7890) or "proxy" in config.json.',
+  )
+  return undefined
+}
+
 /**
  * The only sanctioned way to issue server-side HTTP requests in this codebase.
  * Validates scheme/host; with an explicit proxy configured, dispatches through
  * it and skips local DNS re-check (resolution happens at the proxy);
  * otherwise resolves and re-checks DNS IPs, then performs the fetch.
  */
-export async function safeFetch(input: string | URL, init?: RequestInit): Promise<Response> {
+export interface SafeFetchInit extends RequestInit {
+  /**
+   * Per-request egress proxy (http/https URL); wins over the process-wide
+   * proxy when set. Used to honor per-account proxy bindings.
+   */
+  agyProxy?: string
+}
+
+/** Per-proxy dispatcher cache; bounded so bad configs cannot leak agents. */
+const perProxyAgents = new Map<string, ProxyAgent>()
+const MAX_PER_PROXY_AGENTS = 8
+
+function agentForProxy(proxy: string): ProxyAgent {
+  const existing = perProxyAgents.get(proxy)
+  if (existing) return existing
+  if (perProxyAgents.size >= MAX_PER_PROXY_AGENTS) {
+    // Drop the oldest binding (perProxyAgentClose deletes it) so bad configs
+    // cannot leak agents; never let cache eviction break a request.
+    const oldest = perProxyAgents.keys().next().value
+    if (oldest !== undefined) {
+      try {
+        void perProxyAgentClose(oldest)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  const agent = new ProxyAgent(proxy)
+  perProxyAgents.set(proxy, agent)
+  return agent
+}
+
+function perProxyAgentClose(proxy: string): Promise<void> | undefined {
+  const agent = perProxyAgents.get(proxy)
+  if (!agent) return undefined
+  perProxyAgents.delete(proxy)
+  const closable = agent as unknown as { close?: () => Promise<void> }
+  return typeof closable.close === 'function' ? closable.close() : undefined
+}
+
+/**
+ * Validate and normalize a user-supplied proxy URL for an account binding.
+ * This build only accepts http/https schemes — SOCKS5 would need an extra
+ * client dependency, and Clash/v2rayN-style mixed ports already cover it.
+ * Throws with a human-readable message on anything unusual.
+ */
+export function normalizeProxyUrl(raw: string): string {
+  const trimmed = raw.trim()
+  if (!trimmed) throw new Error('代理地址为空')
+  let parsed: URL
+  try {
+    parsed = new URL(trimmed)
+  } catch {
+    throw new Error('代理地址不是合法的 URL')
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('仅支持 http:// 或 https:// 代理；socks5 请改用 Clash/v2rayN 的混合端口（如 http://127.0.0.1:7890）')
+  }
+  if (!parsed.hostname) throw new Error('代理缺少主机名')
+  if (parsed.username.length + parsed.password.length > 256) throw new Error('代理认证信息过长')
+  parsed.hash = ''
+  return parsed.toString()
+}
+
+/** `protocol//host:port` display form with credentials stripped; `***` when unparseable. */
+export function maskProxyUrl(raw: string | undefined): string | undefined {
+  if (!raw) return undefined
+  try {
+    const parsed = new URL(raw.trim())
+    const port = parsed.port !== '' ? `:${parsed.port}` : ''
+    return `${parsed.protocol}//${parsed.hostname}${port}`
+  } catch {
+    return '***'
+  }
+}
+
+/**
+ * Two-stage usable-ness probe of a proxy URL: actually dispatch through it to
+ * a fixed fast external endpoint. Fixed target on purpose — this checks the
+ * PATH, not arbitrary URLs, so it deliberately bypasses safeFetch's SSRF host
+ * policy (same carve-out rationale as detectLocalHttpProxy).
+ */
+export async function probeProxy(
+  proxyUrl: string,
+  timeoutMs = 5_000,
+): Promise<{ ok: boolean; latencyMs?: number; error?: string }> {
+  const startedAt = Date.now()
+  let agent: ProxyAgent | undefined
+  try {
+    agent = new ProxyAgent(proxyUrl)
+    const response = await undiciFetch('https://www.gstatic.com/generate_204', {
+      method: 'GET',
+      signal: AbortSignal.timeout(timeoutMs),
+      dispatcher: agent,
+    })
+    if (response.status === 204 || response.ok) {
+      return { ok: true, latencyMs: Date.now() - startedAt }
+    }
+    return { ok: false, error: `代理可达但出口探测返回 HTTP ${response.status}` }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  } finally {
+    try {
+      await agent?.close()
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+export async function safeFetch(input: string | URL, init?: SafeFetchInit): Promise<Response> {
   const url = assertSafeOutboundUrl(input)
+  const { agyProxy, ...rest } = init ?? {}
+  const explicit = agyProxy?.trim()
+  if (explicit) {
+    // Per-request proxy path: resolution happens at the proxy, so the local
+    // DNS re-check is skipped exactly like the process-wide proxy case.
+    return undiciFetch(url, { ...rest, dispatcher: agentForProxy(explicit) } as UndiciRequestInit) as unknown as Response
+  }
   const dispatcher = resolveProxyDispatcher()
   if (dispatcher) {
-    return fetch(url, { ...init, dispatcher } as unknown as RequestInit)
+    // Use undici's fetch: the global fetch rejects a `dispatcher` option
+    // (UND_ERR_INVALID_ARG: invalid onRequestStart method).
+    return undiciFetch(url, { ...rest, dispatcher } as UndiciRequestInit) as unknown as Response
   }
   await assertSafeHostResolved(url)
-  return fetch(url, init)
+  return undiciFetch(url, rest as UndiciRequestInit | undefined) as unknown as Response
 }

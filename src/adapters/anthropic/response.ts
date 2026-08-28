@@ -3,12 +3,8 @@
  */
 
 import { originalToolName } from '../shared/tools.js'
-import { normalizedFinishReason, type ParsedUpstreamResponse } from '../shared/frame.js'
+import { isSafetyBlock, type ParsedUpstreamResponse } from '../shared/frame.js'
 import type { FormatContext } from '../shared/format-spec.js'
-
-export function newAnthropicMessageId(): string {
-  return `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`
-}
 
 export type AnthropicStopReason = 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | 'refusal'
 
@@ -16,17 +12,9 @@ export function mapStopReason(
   finishReason: string | undefined,
   hasToolCalls: boolean,
 ): AnthropicStopReason {
-  switch (finishReason) {
-    case 'MAX_TOKENS':
-      return 'max_tokens'
-    case 'SAFETY':
-    case 'PROHIBITED_CONTENT':
-    case 'RECITATION':
-    case 'BLOCKLIST':
-      return 'refusal'
-    default:
-      return hasToolCalls ? 'tool_use' : 'end_turn'
-  }
+  if (finishReason === 'MAX_TOKENS') return 'max_tokens'
+  if (isSafetyBlock(finishReason)) return 'refusal'
+  return hasToolCalls ? 'tool_use' : 'end_turn'
 }
 
 function contentBlocks(parsed: ParsedUpstreamResponse, ctx: FormatContext): Array<Record<string, unknown>> {

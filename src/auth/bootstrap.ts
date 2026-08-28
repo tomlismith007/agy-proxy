@@ -8,7 +8,7 @@
  */
 
 import { AGY_ENDPOINT_FALLBACKS } from '../upstream/endpoints.js'
-import { getBootstrapUserAgent, getClientMetadataHeader, getGenerationUserAgent } from '../upstream/fingerprint.js'
+import { getBootstrapUserAgent, getClientMetadataHeader } from '../upstream/fingerprint.js'
 import { safeFetch } from '../util/urlguard.js'
 import { createLogger } from '../util/log.js'
 
@@ -70,8 +70,12 @@ function bootstrapHeaders(accessToken: string): Record<string, string> {
   }
 }
 
-async function fetchJson(url: string, init: RequestInit): Promise<Response> {
-  return safeFetch(url, { ...init, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })
+async function fetchJson(url: string, init: RequestInit, proxyUrl?: string): Promise<Response> {
+  return safeFetch(url, {
+    ...init,
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    ...(proxyUrl ? { agyProxy: proxyUrl } : {}),
+  })
 }
 
 export interface BootstrapResult {
@@ -80,15 +84,19 @@ export interface BootstrapResult {
 }
 
 /** Resolve project + tier via loadCodeAssist across fallback endpoints. */
-export async function loadCodeAssist(accessToken: string): Promise<BootstrapResult> {
+export async function loadCodeAssist(accessToken: string, proxyUrl?: string): Promise<BootstrapResult> {
   const headers = bootstrapHeaders(accessToken)
   for (const base of AGY_ENDPOINT_FALLBACKS) {
     try {
-      const response = await fetchJson(`${base}/v1internal:loadCodeAssist`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ metadata: bootstrapMetadata() }),
-      })
+      const response = await fetchJson(
+        `${base}/v1internal:loadCodeAssist`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ metadata: bootstrapMetadata() }),
+        },
+        proxyUrl,
+      )
       if (!response.ok) continue
       const data = (await response.json()) as CodeAssistData
       const projectId = extractProjectId(data)
@@ -109,6 +117,7 @@ export async function loadCodeAssist(accessToken: string): Promise<BootstrapResu
 export async function onboardAndDiscoverProject(
   accessToken: string,
   tierId: string,
+  proxyUrl?: string,
 ): Promise<BootstrapResult> {
   const headers = bootstrapHeaders(accessToken)
   const metadata = bootstrapMetadata()
@@ -118,15 +127,19 @@ export async function onboardAndDiscoverProject(
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       for (const base of AGY_ENDPOINT_FALLBACKS) {
-        const response = await fetchJson(`${base}/v1internal:onboardUser`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ tier_id: tierId, metadata }),
-        })
+        const response = await fetchJson(
+          `${base}/v1internal:onboardUser`,
+          {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ tier_id: tierId, metadata }),
+          },
+          proxyUrl,
+        )
         if (!response.ok) continue
         const result = (await response.json()) as { done?: boolean }
         if (result.done === true) {
-          const discovered = await loadCodeAssist(accessToken)
+          const discovered = await loadCodeAssist(accessToken, proxyUrl)
           if (discovered.projectId) return discovered
         }
       }
@@ -140,12 +153,9 @@ export async function onboardAndDiscoverProject(
 }
 
 /** Full bootstrap for a fresh login: discover project, onboard when needed. */
-export async function bootstrapAccount(accessToken: string): Promise<BootstrapResult> {
-  const discovered = await loadCodeAssist(accessToken)
+export async function bootstrapAccount(accessToken: string, proxyUrl?: string): Promise<BootstrapResult> {
+  const discovered = await loadCodeAssist(accessToken, proxyUrl)
   if (discovered.projectId) return discovered
   log.info('no Cloud Code project found; attempting onboarding')
-  return onboardAndDiscoverProject(accessToken, discovered.tierId)
+  return onboardAndDiscoverProject(accessToken, discovered.tierId, proxyUrl)
 }
-
-/** Re-exported for callers building generation requests (UA shape differs). */
-export { getGenerationUserAgent }

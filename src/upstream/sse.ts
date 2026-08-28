@@ -4,7 +4,6 @@
  */
 
 export interface SseEvent {
-  event?: string
   data: string
 }
 
@@ -15,13 +14,11 @@ export async function* parseSseStream(
 ): AsyncGenerator<SseEvent, void, undefined> {
   const reader = body.getReader()
   let buffer = ''
-  let eventName: string | undefined
   let dataLines: string[] = []
 
   const flush = function* (): Generator<SseEvent, void, undefined> {
     if (dataLines.length === 0) return
-    yield { event: eventName, data: dataLines.join('\n') }
-    eventName = undefined
+    yield { data: dataLines.join('\n') }
     dataLines = []
   }
 
@@ -42,10 +39,7 @@ export async function* parseSseStream(
           continue
         }
         if (line.startsWith(':')) continue // comment / keep-alive
-
-        if (line.startsWith('event:')) {
-          eventName = line.slice(6).trim()
-        } else if (line.startsWith('data:')) {
+        if (line.startsWith('data:')) {
           dataLines.push(line.slice(5).trimStart())
         }
       }

@@ -10,12 +10,19 @@
     "agy-proxy": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && npm run build:ui && node scripts/copy-admin-assets.mjs",
+    "build:api": "tsc",
+    "build:ui": "npm --prefix admin-ui run build",
     "typecheck": "tsc --noEmit",
     "start": "node dist/index.js serve",
     "login": "node dist/index.js login",
-    "test": "node tests/adapter-smoke.mjs"
+    "test": "npm run -s build:api && node tests/adapter-smoke.mjs && node tests/pool-smoke.mjs && node tests/usage-history-smoke.mjs"
   },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "prepublishOnly": "npm run build",
   "dependencies": {
     "@hono/node-server": "^1.14.4",
     "commander": "^12.1.0",

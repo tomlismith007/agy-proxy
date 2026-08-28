@@ -32,7 +32,15 @@ export interface AccountRecord {
   refreshToken: string
   projectId?: string
   tierId?: string
-  clientId?: string
+  /** OAuth client secret used for token refresh; stored encrypted so later
+   * refreshes never depend on a shell env var being present. */
+  clientSecret?: string
+  /**
+   * Per-account egress proxy (http/https URL). When set, every upstream call
+   * for this account dispatches through it instead of the global proxy, so
+   * each account keeps its own IP identity. Only ever surfaced masked.
+   */
+  proxyUrl?: string
   accessToken?: string
   /** Absolute epoch ms when the access token expires. */
   expiresAt?: number
@@ -47,7 +55,13 @@ export interface AccountRecord {
   cachedQuotaUpdatedAt?: number
   verificationRequired?: boolean
   verificationRequiredReason?: string
+  /** Google validation link captured from a VALIDATION_REQUIRED (403) response. */
+  validationUrl?: string
   consecutiveInvalidGrant?: number
+  /** Last health-probe outcome (background loop + manual verify). */
+  lastHealthAt?: number
+  lastHealthOk?: boolean
+  lastHealthError?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +198,7 @@ export interface FinalizedCall {
 export type FailureKind =
   | 'rate-limit'
   | 'auth-failure'
+  | 'validation-blocked'
   | 'network-error'
   | 'request-error'
   | 'transient'
@@ -197,4 +212,8 @@ export interface ClassifiedError {
   resetTime?: string
   message?: string
   rateLimitCategory?: RateLimitCategory
+  /** Set on validation-blocked failures: where the user must re-validate. */
+  validationUrl?: string
+  /** Undici connect-layer code from the cause chain (ECONNREFUSED, UND_ERR_CONNECT_TIMEOUT, …). */
+  connectCode?: string
 }

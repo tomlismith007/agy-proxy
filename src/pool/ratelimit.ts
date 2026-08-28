@@ -18,6 +18,8 @@ export const FULL_QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1000
 export const RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000
 /** Cap on server-reported resets for per-minute limits (guards bogus values). */
 export const MAX_RATE_LIMIT_COOLDOWN_MS = 30 * 60 * 1000
+/** Temporary block for Google VALIDATION_REQUIRED risk control (self-heals). */
+export const VALIDATION_BLOCK_COOLDOWN_MS = 10 * 60 * 1000
 
 function backoffFor(consecutiveFailures: number, maxJitterMs = 1_000): number {
   const index = Math.min(Math.max(consecutiveFailures, 0), BACKOFF_TIERS_MS.length - 1)
@@ -88,6 +90,7 @@ export function decideRotation(
     retryAfterMs?: number
     resetTime?: string
     consecutiveFailures?: number
+    validationUrl?: string
   } = {},
 ): RotationDecision {
   const now = Date.now()
@@ -124,6 +127,17 @@ export function decideRotation(
       record.verificationRequiredReason = 'upstream rejected credentials (401/403)'
       return { action: 'fail' }
     }
+    case 'validation-blocked': {
+      // Temporary risk control, NOT dead credentials: cool briefly and keep
+      // the account enabled so it re-enters rotation automatically; the user
+      // can clear the flag early via `agy-proxy verify` after validating.
+      record.coolingDownUntil = now + VALIDATION_BLOCK_COOLDOWN_MS
+      record.cooldownReason = 'Google requires account validation'
+      record.verificationRequired = true
+      record.verificationRequiredReason = 'VALIDATION_REQUIRED: re-validate in a browser, then run verify'
+      if (options.validationUrl) record.validationUrl = options.validationUrl
+      return { action: 'rotate', backoffMs: 2_000 }
+    }
     case 'network-error': {
       record.coolingDownUntil = now + backoffMs
       record.cooldownReason = 'network error'
@@ -151,5 +165,18 @@ export function decideRotationFromClassified(
     retryAfterMs: classified.retryAfterMs,
     resetTime: classified.resetTime,
     consecutiveFailures,
+    validationUrl: classified.validationUrl,
   })
+}
+
+/**
+ * Fail-closed gate for accounts bound to their own egress proxy: connect-layer
+ * failures mean THIS proxy path is dead (proxy down / wrong port), not that
+ * Google rejected or rate-limited the account. Such attempts must not write
+ * cooldowns or bump failure streaks — the account is skipped untouched and
+ * retried unchanged next round. Without an account proxy the normal engine
+ * still applies cooldowns (direct connectivity failing IS account-agnostic).
+ */
+export function isProxyPathOutage(kind: FailureKind, hasAccountProxy: boolean): boolean {
+  return hasAccountProxy && kind === 'network-error'
 }

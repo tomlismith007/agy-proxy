@@ -41,7 +41,16 @@ function needsRefresh(record: AccountRecord, force: boolean, now: number): boole
  * Return a usable access token for the account, refreshing through the store
  * when missing/expiring (or when `force`). Throws RefreshError when the
  * refresh token is dead; the account is then disabled in the store.
+ *
+ * Concurrent callers for the same account share one in-flight refresh
+ * (single-flight): parallel requests hitting an expiring token must not fire
+ * several back-to-back token-endpoint exchanges — that reads as scripted
+ * automation upstream and can race the stored grant.
  */
+
+/** email -> shared in-flight refresh; entries self-remove when settled. */
+const inflightRefreshes = new Map<string, Promise<string>>()
+
 export async function ensureFreshAccessToken(
   store: AccountStore,
   email: string,
@@ -49,13 +58,31 @@ export async function ensureFreshAccessToken(
 ): Promise<string> {
   const record = store.get(email)
   if (!record) throw new RefreshError(`account not found: ${email}`, false)
-  const now = Date.now()
-  if (!needsRefresh(record, options.force === true, now)) {
+  if (!needsRefresh(record, options.force === true, Date.now())) {
     return record.accessToken!
   }
+  const existing = inflightRefreshes.get(email)
+  if (existing) return existing
+
+  const pending = doRefreshConfirmed(store, email).finally(() => {
+    if (inflightRefreshes.get(email) === pending) inflightRefreshes.delete(email)
+  })
+  inflightRefreshes.set(email, pending)
+  return pending
+}
+
+async function doRefreshConfirmed(store: AccountStore, email: string): Promise<string> {
+  const record = store.get(email)
+  if (!record) throw new RefreshError(`account not found: ${email}`, false)
+
+  // Prefer the secret captured into the (encrypted) account record at login;
+  // fall back to the shell env so pre-existing setups keep working.
+  const usedSecret = record.clientSecret ?? process.env.AGY_CLIENT_SECRET?.trim()
 
   const attempt = async (): Promise<string> => {
-    const grant = await refreshAccessToken(record.refreshToken)
+    // Refresh through the account's own proxy binding when one is set, so the
+    // token exchange shares the account's egress IP identity.
+    const grant = await refreshAccessToken(record.refreshToken, usedSecret, record.proxyUrl)
     store.update(email, (r) => {
       r.accessToken = grant.accessToken
       r.refreshToken = grant.refreshToken ?? r.refreshToken
@@ -65,6 +92,9 @@ export async function ensureFreshAccessToken(
       r.verificationRequired = false
       r.verificationRequiredReason = undefined
       r.enabled = true
+      // Persist whichever secret worked so later refreshes never depend on
+      // the server process having AGY_CLIENT_SECRET exported.
+      if (usedSecret && r.clientSecret !== usedSecret) r.clientSecret = usedSecret
     })
     return grant.accessToken
   }

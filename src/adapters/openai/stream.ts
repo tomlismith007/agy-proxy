@@ -5,20 +5,14 @@
  */
 
 import { rememberSignature } from '../shared/thinking.js'
-import { decodeStreamFrame } from '../shared/frame.js'
+import { decodeStreamFrame, normalizedFinishReason } from '../shared/frame.js'
 import { originalToolName } from '../shared/tools.js'
 import { upstreamErrorPayloads, type ClientErrorPayload } from '../shared/errors.js'
 import { mapUsage } from './response.js'
 import type { SseEvent } from '../../upstream/sse.js'
+import type { FormatContext } from '../shared/format-spec.js'
 
-export interface OpenAiStreamContext {
-  requestedModel: string
-  toolNameMap: Map<string, string>
-  created: number
-  responseId: string
-}
-
-function chunkFrame(ctx: OpenAiStreamContext, delta: Record<string, unknown>, finishReason: string | null): string {
+function chunkFrame(ctx: FormatContext, delta: Record<string, unknown>, finishReason: string | null): string {
   return `data: ${JSON.stringify({
     id: ctx.responseId,
     object: 'chat.completion.chunk',
@@ -42,7 +36,7 @@ function errorChunk(payload: ClientErrorPayload): string {
 /** Consume upstream SSE events and yield ready-to-write OpenAI SSE strings. */
 export async function* streamOpenAiChunks(
   events: AsyncGenerator<SseEvent, void, undefined>,
-  ctx: OpenAiStreamContext,
+  ctx: FormatContext,
 ): AsyncGenerator<string> {
   yield chunkFrame(ctx, { role: 'assistant', content: '' }, null)
 
@@ -52,14 +46,7 @@ export async function* streamOpenAiChunks(
 
   const applyFinish = (raw: string | undefined): void => {
     if (!raw) return
-    finishReason =
-      toolCallIndex > 0 && raw === 'STOP'
-        ? 'tool_calls'
-        : raw === 'MAX_TOKENS'
-          ? 'length'
-          : ['SAFETY', 'PROHIBITED_CONTENT', 'RECITATION', 'BLOCKLIST'].includes(raw)
-            ? 'content_filter'
-            : 'stop'
+    finishReason = toolCallIndex > 0 && raw === 'STOP' ? 'tool_calls' : normalizedFinishReason(raw)
   }
 
   try {

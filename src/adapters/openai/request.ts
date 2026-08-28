@@ -3,7 +3,7 @@
  */
 
 import { safeFetch } from '../../util/urlguard.js'
-import { ApiError } from '../shared/errors.js'
+import { ApiError, expectString } from '../shared/errors.js'
 import { sanitizeTools } from '../shared/tools.js'
 import {
   assertAcceptedImageMime,
@@ -28,11 +28,6 @@ interface RawMessage {
 interface RawToolCall {
   id?: unknown
   function?: { name?: unknown; arguments?: unknown }
-}
-
-function expectString(value: unknown, field: string): string {
-  if (typeof value !== 'string') throw new ApiError(400, 'invalid_request_error', `field "${field}" must be a string`)
-  return value
 }
 
 async function fetchImagePart(url: string): Promise<UserPart> {

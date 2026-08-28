@@ -3,31 +3,16 @@
  */
 
 import { originalToolName } from '../shared/tools.js'
-import { normalizedFinishReason, type ParsedUpstreamResponse } from '../shared/frame.js'
+import { normalizedFinishReason, opaqueId, type ParsedUpstreamResponse } from '../shared/frame.js'
 import type { ParsedFunctionCall } from '../shared/frame.js'
-
-export interface OpenAiResponseContext {
-  /** Model id as the client requested it. */
-  requestedModel: string
-  toolNameMap: Map<string, string>
-  created: number
-  responseId: string
-}
-
-function randomId(prefix: string): string {
-  return `${prefix}_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`
-}
-
-export function newChatCompletionId(): string {
-  return randomId('chatcmpl')
-}
+import type { FormatContext } from '../shared/format-spec.js'
 
 function toToolCalls(
   calls: readonly ParsedFunctionCall[],
   toolNameMap: Map<string, string>,
 ): Array<Record<string, unknown>> {
   return calls.map((call) => ({
-    id: call.id ?? randomId('call'),
+    id: call.id ?? opaqueId('call'),
     type: 'function',
     function: {
       name: originalToolName(toolNameMap, call.name),
@@ -50,7 +35,7 @@ export function mapUsage(usage: ParsedUpstreamResponse['usage']): Record<string,
 /** Build the `chat.completion` object from a parsed upstream response. */
 export function buildOpenAiResponse(
   parsed: ParsedUpstreamResponse,
-  ctx: OpenAiResponseContext,
+  ctx: FormatContext,
 ): Record<string, unknown> {
   const message: Record<string, unknown> = { role: 'assistant' }
   if (parsed.thoughtText.length > 0) message.reasoning_content = parsed.thoughtText

@@ -4,6 +4,7 @@
  * - full generation response -> a flat parsed shape adapters map from.
  */
 
+import { randomUUID } from 'node:crypto'
 import { rememberSignature } from './thinking.js'
 import type {
   UpstreamCandidate,
@@ -44,6 +45,15 @@ interface RawStreamChunk {
   usageMetadata?: UsageMetadata
 }
 
+/** Strip the upstream `{response: …}` wrapper if present (shared with client.ts). */
+export function unwrapResponseEnvelope<T>(raw: T): T {
+  if (raw && typeof raw === 'object') {
+    const inner = (raw as Partial<Record<'response', T>>).response
+    if (inner !== undefined) return inner
+  }
+  return raw
+}
+
 function extractErrorMessage(raw: unknown): string | undefined {
   if (!raw || typeof raw !== 'object') return undefined
   const record = raw as Record<string, unknown>
@@ -57,7 +67,7 @@ function extractErrorMessage(raw: unknown): string | undefined {
 export function decodeStreamFrame(data: string): DecodedFrame {
   let chunk: RawStreamChunk
   try {
-    chunk = JSON.parse(data) as RawStreamChunk
+    chunk = unwrapResponseEnvelope(JSON.parse(data) as RawStreamChunk)
   } catch {
     return { type: 'empty' }
   }
@@ -145,20 +155,24 @@ export function parseUpstreamResponse(response: UpstreamResponse): ParsedUpstrea
   return parsed
 }
 
+const SAFETY_FINISH_REASONS = new Set(['SAFETY', 'PROHIBITED_CONTENT', 'RECITATION', 'BLOCKLIST'])
+
+/** Upstream reasons meaning the model was blocked for safety/policy. */
+export function isSafetyBlock(finishReason: string | undefined): boolean {
+  return finishReason !== undefined && SAFETY_FINISH_REASONS.has(finishReason)
+}
+
+/** Short opaque id with a prefix (response + tool-call ids share this shape). */
+export function opaqueId(prefix: string): string {
+  return `${prefix}_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+}
+
 /**
  * Map an upstream finishReason to the OpenAI-style triad used across both
  * formats (`stop` / `length` / `content_filter`).
  */
 export function normalizedFinishReason(finishReason: string | undefined): 'stop' | 'length' | 'content_filter' {
-  switch (finishReason) {
-    case 'MAX_TOKENS':
-      return 'length'
-    case 'SAFETY':
-    case 'PROHIBITED_CONTENT':
-    case 'RECITATION':
-    case 'BLOCKLIST':
-      return 'content_filter'
-    default:
-      return 'stop'
-  }
+  if (finishReason === 'MAX_TOKENS') return 'length'
+  if (isSafetyBlock(finishReason)) return 'content_filter'
+  return 'stop'
 }

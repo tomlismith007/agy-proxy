@@ -2,7 +2,7 @@
  * Anthropic Messages request parsing -> shared AdapterDraft.
  */
 
-import { ApiError } from '../shared/errors.js'
+import { ApiError, expectString } from '../shared/errors.js'
 import { sanitizeTools } from '../shared/tools.js'
 import {
   assertAcceptedImageMime,
@@ -12,11 +12,6 @@ import {
   type UserPart,
 } from '../shared/contents.js'
 import type { AdapterDraft } from '../../types.js'
-
-function expectString(value: unknown, field: string): string {
-  if (typeof value !== 'string') throw new ApiError(400, 'invalid_request_error', `field "${field}" must be a string`)
-  return value
-}
 
 interface RawContentBlock {
   type?: unknown

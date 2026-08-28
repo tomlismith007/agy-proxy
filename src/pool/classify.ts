@@ -30,6 +30,31 @@ export function classifyRateLimit(
 
 const RESET_FIELDS = ['resetTime', 'reset_time', 'resetAt', 'quotaResetTime'] as const
 
+/** Google's temporary risk-control marker: the account must re-validate in a browser. */
+const VALIDATION_MARKER = 'validation_required'
+
+/**
+ * Pull the re-validation link out of a VALIDATION_REQUIRED body. Google has
+ * shipped it both as a JSON field and as a bare URL inside the message text.
+ */
+function extractValidationUrl(bodyText: string | undefined): string | undefined {
+  if (!bodyText) return undefined
+  try {
+    const data = JSON.parse(bodyText) as Record<string, unknown>
+    const candidates = [data, data.error as Record<string, unknown> | undefined]
+    for (const source of candidates) {
+      if (!source || typeof source !== 'object') continue
+      for (const field of ['validationUrl', 'validation_url']) {
+        const value = source[field]
+        if (typeof value === 'string' && value.startsWith('http')) return value
+      }
+    }
+  } catch {
+    // not JSON — fall through to the regex
+  }
+  return bodyText.match(/https:\/\/[^\s"'<>\\]+/)?.[0]
+}
+
 function extractResetTime(bodyText: string | undefined): string | undefined {
   if (!bodyText) return undefined
   try {
@@ -71,6 +96,17 @@ export function classifyHttpError(status: number, headers: Headers, bodyText?: s
     return { kind: 'auth-failure', status, message: snippet }
   }
   if (status === 403) {
+    // Temporary risk control: Google wants this account re-validated in a
+    // browser. It self-heals after validation, so never treat it as dead
+    // credentials — the pool cools it briefly and records the link.
+    if ((bodyText ?? '').toLowerCase().includes(VALIDATION_MARKER)) {
+      return {
+        kind: 'validation-blocked',
+        status,
+        message: snippet,
+        validationUrl: extractValidationUrl(bodyText),
+      }
+    }
     // Google also reports quota walls as 403 RESOURCE_EXHAUSTED, and the
     // endpoint fallback chain ends on hosts answering 403 for "no license".
     // Only treat 403 as auth failure when there is no quota wording.
@@ -103,12 +139,31 @@ export function classifyHttpError(status: number, headers: Headers, bodyText?: s
 export function classifyFetchError(error: unknown): ClassifiedError {
   const message = error instanceof Error ? error.message : String(error)
   if (error instanceof Error && error.name === 'TimeoutError') {
-    return { kind: 'network-error', message }
+    return { kind: 'network-error', message, connectCode: extractConnectCode(error) }
   }
   if (error instanceof Error && error.name === 'AbortError') {
     return { kind: 'network-error', message }
   }
-  return { kind: 'network-error', message }
+  return { kind: 'network-error', message, connectCode: extractConnectCode(error) }
+}
+
+/** Undici wraps connect-layer failures in error.cause chains — dig the code out. */
+const CONNECT_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_SOCKET',
+  'EPROTO',
+  'ETIMEDOUT',
+])
+
+function extractConnectCode(error: unknown, depth = 0): string | undefined {
+  if (depth > 4 || !error || typeof error !== 'object') return undefined
+  const candidate = error as { code?: unknown; cause?: unknown }
+  if (typeof candidate.code === 'string' && CONNECT_CODES.has(candidate.code)) return candidate.code
+  return extractConnectCode(candidate.cause, depth + 1)
 }
 
 /** Error carrying its classification so the pool can act on it. */
@@ -118,6 +173,10 @@ export class ClassifiedUpstreamError extends Error {
   readonly rateLimitCategory?: RateLimitCategory
   readonly retryAfterMs?: number
   readonly resetTime?: string
+  /** Preserved so decideRotation can record the Google re-validation link. */
+  readonly validationUrl?: string
+  /** Connect-layer code when the failure came from fetch/DNS/proxy dialing. */
+  readonly connectCode?: string
 
   constructor(classified: ClassifiedError) {
     super(classified.message ?? classified.kind)
@@ -127,5 +186,7 @@ export class ClassifiedUpstreamError extends Error {
     this.rateLimitCategory = classified.rateLimitCategory
     this.retryAfterMs = classified.retryAfterMs
     this.resetTime = classified.resetTime
+    this.validationUrl = classified.validationUrl
+    this.connectCode = classified.connectCode
   }
 }
