@@ -7,7 +7,8 @@
 import { AccountStore } from './store.js'
 import { refreshAccessToken } from './oauth.js'
 import type { AccountRecord } from '../types.js'
-import { createLogger } from '../util/log.js'
+import { createLogger, errText } from '../util/log.js'
+import { sleep } from '../util/concurrency.js'
 
 const log = createLogger('tokens')
 
@@ -24,10 +25,6 @@ export class RefreshError extends Error {
     super(message)
     this.name = 'RefreshError'
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function needsRefresh(record: AccountRecord, force: boolean, now: number): boolean {
@@ -102,7 +99,7 @@ async function doRefreshConfirmed(store: AccountStore, email: string): Promise<s
   try {
     return await attempt()
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = errText(error)
     if (!message.includes('invalid_grant')) {
       throw new RefreshError(`token refresh failed: ${message}`, false)
     }
@@ -112,7 +109,7 @@ async function doRefreshConfirmed(store: AccountStore, email: string): Promise<s
     try {
       return await attempt()
     } catch (retryError) {
-      const retryMessage = retryError instanceof Error ? retryError.message : String(retryError)
+      const retryMessage = errText(retryError)
       if (retryMessage.includes('invalid_grant')) {
         log.error(`invalid_grant confirmed twice for ${email}; disabling account`)
         store.update(email, (r) => {

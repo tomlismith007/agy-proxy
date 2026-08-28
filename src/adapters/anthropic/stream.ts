@@ -10,6 +10,7 @@ import { rememberSignature } from '../shared/thinking.js'
 import { decodeStreamFrame } from '../shared/frame.js'
 import { originalToolName } from '../shared/tools.js'
 import { upstreamErrorPayloads, type ClientErrorPayload } from '../shared/errors.js'
+import { errText } from '../../util/log.js'
 import { mapStopReason } from './response.js'
 import type { SseEvent } from '../../upstream/sse.js'
 import type { FormatContext } from '../shared/format-spec.js'
@@ -152,7 +153,7 @@ export async function* streamAnthropicEvents(
     })
     yield frame('message_stop', { type: 'message_stop' })
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = errText(error)
     yield errorEvent(upstreamErrorPayloads('network-error', `upstream stream interrupted: ${message}`).anthropic)
   }
 }

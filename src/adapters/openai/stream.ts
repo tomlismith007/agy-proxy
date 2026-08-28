@@ -8,6 +8,7 @@ import { rememberSignature } from '../shared/thinking.js'
 import { decodeStreamFrame, normalizedFinishReason } from '../shared/frame.js'
 import { originalToolName } from '../shared/tools.js'
 import { upstreamErrorPayloads, type ClientErrorPayload } from '../shared/errors.js'
+import { errText } from '../../util/log.js'
 import { mapUsage } from './response.js'
 import type { SseEvent } from '../../upstream/sse.js'
 import type { FormatContext } from '../shared/format-spec.js'
@@ -114,7 +115,7 @@ export async function* streamOpenAiChunks(
     }
     yield 'data: [DONE]\n\n'
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = errText(error)
     if (finishReason === null) {
       yield errorChunk(upstreamErrorPayloads('network-error', `upstream stream interrupted: ${message}`).openai)
     }

@@ -8,7 +8,13 @@
 
 import { signatureForCall } from './thinking.js'
 import { ApiError } from './errors.js'
-import type { UpstreamContent, UpstreamPart } from '../../types.js'
+import type {
+  AdapterDraft,
+  FunctionDeclaration,
+  GenerationConfig,
+  UpstreamContent,
+  UpstreamPart,
+} from '../../types.js'
 
 export interface TextPart {
   kind: 'text'
@@ -119,5 +125,36 @@ export function buildUpstreamContents(messages: readonly NormalMessage[]): Built
   return {
     contents,
     ...(systemChunks.length > 0 ? { systemText: systemChunks.join('\n\n') } : {}),
+  }
+}
+
+/** Tool-set info carried into the draft by the request parsers. */
+export interface ParsedTools {
+  declarations?: FunctionDeclaration[]
+  toolNameMap?: Map<string, string>
+}
+
+/**
+ * Shared tail of both request parsers: convert normalized messages into
+ * upstream contents and assemble the final draft.
+ */
+export function assembleDraft(
+  model: string,
+  messages: NormalMessage[],
+  tools: ParsedTools | undefined,
+  generationConfig: GenerationConfig,
+  reasoningEffort: AdapterDraft['reasoningEffort'],
+  stream: boolean,
+): AdapterDraft & { stream: boolean } {
+  const built = buildUpstreamContents(messages)
+  return {
+    model,
+    contents: built.contents,
+    systemInstructionText: built.systemText,
+    declarations: tools?.declarations,
+    ...(tools?.toolNameMap ? { toolNameMap: tools.toolNameMap } : {}),
+    generationConfig,
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    stream,
   }
 }

@@ -106,12 +106,6 @@ function sanitizeNode(input: unknown): UpstreamSchema | undefined {
   return output
 }
 
-export interface SanitizedTool {
-  declaration: FunctionDeclaration
-  /** original client-visible tool name */
-  originalName: string
-}
-
 export interface SanitizedToolSet {
   declarations: FunctionDeclaration[]
   /** upstream-safe name -> original name (for response mapping). */
@@ -177,4 +171,17 @@ export function sanitizeTools(
 export function originalToolName(nameMap: Map<string, string>, upstreamName: string | undefined): string {
   if (!upstreamName) return 'unknown_tool'
   return nameMap.get(upstreamName) ?? upstreamName
+}
+
+/**
+ * Shared tools block of both request parsers: run the sanitizer over a client
+ * `tools` array and keep the result only when at least one declaration
+ * survived. Undefined means "omit the tools field entirely".
+ */
+export function sanitizedToolSet(
+  tools?: ReadonlyArray<{ name?: unknown; description?: unknown; parameters?: unknown; input_schema?: unknown }>,
+): SanitizedToolSet | undefined {
+  if (!tools || tools.length === 0) return undefined
+  const sanitized = sanitizeTools(tools)
+  return sanitized.declarations.length > 0 ? sanitized : undefined
 }

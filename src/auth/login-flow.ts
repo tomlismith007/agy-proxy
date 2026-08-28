@@ -14,12 +14,14 @@ import { spawn } from 'node:child_process'
 import {
   buildAuthorizationUrl,
   decodeState,
+  DEFAULT_CALLBACK_PORT,
   ensureClientSecret,
   exchangeCodeForTokens,
   fetchUserEmail,
 } from './oauth.js'
 import { bootstrapAccount } from './bootstrap.js'
 import type { AccountStore } from './store.js'
+import { errText } from '../util/log.js'
 
 export interface CallbackResult {
   code: string
@@ -195,9 +197,11 @@ export class LoginManager {
     if (this.status.phase === 'waiting' || this.status.phase === 'exchanging') {
       return this.getStatus()
     }
-    const port = await findFreePort(51121)
+    const port = await findFreePort(DEFAULT_CALLBACK_PORT)
     const redirectUri =
-      port === 51121 ? 'http://localhost:51121/oauth-callback' : `http://localhost:${port}/oauth-callback`
+      port === DEFAULT_CALLBACK_PORT
+        ? `http://localhost:${DEFAULT_CALLBACK_PORT}/oauth-callback`
+        : `http://localhost:${port}/oauth-callback`
     const auth = buildAuthorizationUrl(redirectUri)
     this.pending = { state: auth.state, port, url: auth.url, redirectUri }
     this.status = { phase: 'waiting', url: auth.url, startedAt: Date.now() }
@@ -205,7 +209,7 @@ export class LoginManager {
     void this.waitForCallback().catch((error: unknown) => {
       this.status = {
         phase: 'error',
-        error: error instanceof Error ? error.message : String(error),
+        error: errText(error),
         url: auth.url,
       }
     })
@@ -246,7 +250,7 @@ export class LoginManager {
       }
       return this.getStatus()
     }
-    const redirectUri = this.pending?.redirectUri ?? 'http://localhost:51121/oauth-callback'
+    const redirectUri = this.pending?.redirectUri ?? `http://localhost:${DEFAULT_CALLBACK_PORT}/oauth-callback`
     await this.finish(code, verifier, redirectUri)
     this.pending = undefined
     return this.getStatus()
@@ -266,7 +270,7 @@ export class LoginManager {
     } catch (error) {
       this.status = {
         phase: 'error',
-        error: error instanceof Error ? error.message : String(error),
+        error: errText(error),
         url: this.status.url,
       }
     }

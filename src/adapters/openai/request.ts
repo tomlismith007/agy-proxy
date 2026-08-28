@@ -3,17 +3,18 @@
  */
 
 import { safeFetch } from '../../util/urlguard.js'
+import { errText } from '../../util/log.js'
 import { ApiError, expectString } from '../shared/errors.js'
-import { sanitizeTools } from '../shared/tools.js'
+import { sanitizedToolSet } from '../shared/tools.js'
 import {
   assertAcceptedImageMime,
-  buildUpstreamContents,
+  assembleDraft,
   type NormalMessage,
   type ToolCallDraft,
   type UserPart,
 } from '../shared/contents.js'
 import { defaultMaxOutputTokens } from '../shared/finalize.js'
-import type { AdapterDraft } from '../../types.js'
+import type { AdapterDraft, GenerationConfig } from '../../types.js'
 
 const IMAGE_MAX_BYTES = 10 * 1024 * 1024
 const IMAGE_FETCH_TIMEOUT_MS = 15_000
@@ -51,7 +52,7 @@ async function fetchImagePart(url: string): Promise<UserPart> {
   try {
     response = await safeFetch(parsedUrl, { signal: AbortSignal.timeout(IMAGE_FETCH_TIMEOUT_MS) })
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error)
+    const reason = errText(error)
     throw new ApiError(400, 'invalid_request_error', `failed to download image: ${reason}`)
   }
   if (!response.ok) {
@@ -188,26 +189,22 @@ export async function parseOpenAiChatRequest(body: unknown): Promise<OpenAiParse
   }
 
   // Tools
-  let declarations: AdapterDraft['declarations']
-  let toolNameMap: Map<string, string> | undefined
-  if (Array.isArray(raw.tools) && raw.tools.length > 0) {
-    const flat = raw.tools.map((tool) => {
-      if (!tool || typeof tool !== 'object') {
-        throw new ApiError(400, 'invalid_request_error', 'tools entries must be objects')
-      }
-      const record = tool as Record<string, unknown>
-      const fn = (record.function ?? {}) as Record<string, unknown>
-      if (record.type !== undefined && record.type !== 'function') {
-        throw new ApiError(400, 'invalid_request_error', `tool type "${String(record.type)}" is not supported`)
-      }
-      return { name: fn.name, description: fn.description, parameters: fn.parameters }
-    })
-    const sanitized = sanitizeTools(flat)
-    if (sanitized.declarations.length > 0) {
-      declarations = sanitized.declarations
-      toolNameMap = sanitized.nameMap
-    }
-  }
+  const tools =
+    Array.isArray(raw.tools) && raw.tools.length > 0
+      ? sanitizedToolSet(
+          raw.tools.map((tool) => {
+            if (!tool || typeof tool !== 'object') {
+              throw new ApiError(400, 'invalid_request_error', 'tools entries must be objects')
+            }
+            const record = tool as Record<string, unknown>
+            const fn = (record.function ?? {}) as Record<string, unknown>
+            if (record.type !== undefined && record.type !== 'function') {
+              throw new ApiError(400, 'invalid_request_error', `tool type "${String(record.type)}" is not supported`)
+            }
+            return { name: fn.name, description: fn.description, parameters: fn.parameters }
+          }),
+        )
+      : undefined
 
   // Generation parameters
   const temperature = typeof raw.temperature === 'number' ? raw.temperature : undefined
@@ -219,6 +216,11 @@ export async function parseOpenAiChatRequest(body: unknown): Promise<OpenAiParse
         ? raw.max_tokens
         : undefined
   const maxOutputTokens = requestedMax ?? defaultMaxOutputTokens(model)
+  const generationConfig: GenerationConfig = {
+    ...(temperature !== undefined ? { temperature } : {}),
+    ...(topP !== undefined ? { topP } : {}),
+    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+  }
 
   let reasoningEffort: AdapterDraft['reasoningEffort']
   if (raw.reasoning_effort === 'low' || raw.reasoning_effort === 'medium' || raw.reasoning_effort === 'high') {
@@ -227,22 +229,7 @@ export async function parseOpenAiChatRequest(body: unknown): Promise<OpenAiParse
     reasoningEffort = 'low'
   }
 
-  const built = buildUpstreamContents(messages)
-
-  return {
-    model,
-    contents: built.contents,
-    systemInstructionText: built.systemText,
-    declarations,
-    ...(toolNameMap ? { toolNameMap } : {}),
-    generationConfig: {
-      ...(temperature !== undefined ? { temperature } : {}),
-      ...(topP !== undefined ? { topP } : {}),
-      ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
-    },
-    ...(reasoningEffort ? { reasoningEffort } : {}),
-    stream: raw.stream === true,
-  }
+  return assembleDraft(model, messages, tools, generationConfig, reasoningEffort, raw.stream === true)
 }
 
 /** Concatenate text out of a content-parts array (system/tool roles). */

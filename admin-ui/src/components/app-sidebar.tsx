@@ -5,13 +5,16 @@ import {
   ChartColumnIcon,
   KeyRoundIcon,
   LayoutDashboardIcon,
+  MoonIcon,
   PauseIcon,
   PlayIcon,
   RefreshCwIcon,
   ServerCogIcon,
   SettingsIcon,
+  SunIcon,
   UsersIcon,
 } from 'lucide-react'
+import { useTheme } from 'next-themes'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -148,9 +151,25 @@ export function AppSidebar({
             </TooltipTrigger>
             <TooltipContent>立即刷新</TooltipContent>
           </Tooltip>
+          <ThemeToggle />
         </div>
       </SidebarFooter>
       <SidebarRail />
     </Sidebar>
+  )
+}
+
+function ThemeToggle() {
+  const { resolvedTheme, setTheme } = useTheme()
+  const dark = resolvedTheme === 'dark'
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={<Button variant="ghost" size="icon-sm" onClick={() => setTheme(dark ? 'light' : 'dark')} />}
+      >
+        {dark ? <SunIcon /> : <MoonIcon />}
+      </TooltipTrigger>
+      <TooltipContent>{dark ? '切换浅色' : '切换深色'}</TooltipContent>
+    </Tooltip>
   )
 }

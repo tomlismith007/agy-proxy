@@ -33,7 +33,6 @@ export const OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token'
 export const OAUTH_USERINFO_URL = 'https://www.googleapis.com/oauth2/v1/userinfo'
 
 export const DEFAULT_CALLBACK_PORT = 51121
-export const DEFAULT_REDIRECT_URI = `http://localhost:${DEFAULT_CALLBACK_PORT}/oauth-callback`
 
 export function resolveClientCredentials(): { clientId: string; clientSecret?: string } {
   return {
@@ -73,7 +72,7 @@ async function fetchPublicClientSecret(): Promise<string | undefined> {
   if (cachedPublicSecret) return cachedPublicSecret
   for (const url of PUBLIC_SECRET_SOURCES) {
     try {
-      const response = await safeFetch(url, { signal: AbortSignal.timeout(10_000) })
+      const response = await safeFetch(url, { timeoutMs: 10_000 })
       if (!response.ok) continue
       const secret = extractPublicSecret(await response.text())
       if (secret) {
@@ -195,7 +194,7 @@ async function postToken(
       Accept: '*/*',
     },
     body: tokenRequestBody({ ...credentials, ...params }),
-    signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
+    timeoutMs: TOKEN_TIMEOUT_MS,
     ...(proxyUrl ? { agyProxy: proxyUrl } : {}),
   })
   const payload = (await response.json().catch(() => ({}))) as TokenPayload
@@ -267,7 +266,7 @@ export async function fetchUserEmail(accessToken: string, proxyUrl?: string): Pr
   try {
     const response = await safeFetch(`${OAUTH_USERINFO_URL}?alt=json`, {
       headers: { Authorization: `Bearer ${accessToken}` },
-      signal: AbortSignal.timeout(10_000),
+      timeoutMs: 10_000,
       ...(proxyUrl ? { agyProxy: proxyUrl } : {}),
     })
     if (!response.ok) return undefined

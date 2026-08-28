@@ -7,7 +7,7 @@
 import { Hono } from 'hono'
 import { serve, type ServerType } from '@hono/node-server'
 import { apiKeyAuth, corsMiddleware, killSwitchMiddleware, requestLogging } from './api/middleware.js'
-import { handleChatRequest, handleCountTokensRequest, type AppContext } from './api/chat-handler.js'
+import { handleChatRequest, handleCountTokensRequest } from './api/chat-handler.js'
 import { OPENAI_FORMAT } from './adapters/openai/format.js'
 import { ANTHROPIC_FORMAT } from './adapters/anthropic/format.js'
 import { Semaphore } from './util/concurrency.js'
@@ -17,9 +17,10 @@ import { startVersionRefreshLoop, type VersionRefresher } from './upstream/finge
 import { startHealthLoop, type HealthLoop } from './pool/health.js'
 import { stats } from './util/stats.js'
 import { UsageHistory } from './util/usage-history.js'
-import { createLogger } from './util/log.js'
+import { createLogger, errText } from './util/log.js'
 import type { AppConfig } from './config.js'
 import type { AccountStore } from './auth/store.js'
+import type { AppContext } from './types.js'
 import { isLoopbackHost, registerAdminPage } from './admin/page.js'
 import { registerAdminRoutes } from './admin/api.js'
 import { VERSION } from './version.js'
@@ -78,7 +79,7 @@ export function createApp(ctx: AppContext): Hono {
         x_source: source,
       })
     } catch (error) {
-      log.error(`models listing failed: ${error instanceof Error ? error.message : String(error)}`)
+      log.error(`models listing failed: ${errText(error)}`)
       return c.json({ object: 'list', data: [] })
     }
   })

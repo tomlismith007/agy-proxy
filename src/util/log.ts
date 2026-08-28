@@ -46,3 +46,8 @@ export function redactSecrets(text: string): string {
     .replace(/sk-agy-[A-Za-z0-9._\-]+/g, 'sk-agy-***')
     .replace(/ya29\.[A-Za-z0-9._\-]+/g, 'ya29.***')
 }
+
+/** Human-readable message from an arbitrary thrown value. */
+export function errText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}

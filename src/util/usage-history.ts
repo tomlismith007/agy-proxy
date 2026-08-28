@@ -9,7 +9,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { createLogger } from './log.js'
+import { createLogger, errText } from './log.js'
 
 const log = createLogger('usage')
 
@@ -67,8 +67,20 @@ export interface UsageRecordInput {
   thoughtsTokens?: number
 }
 
-const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/
+const DAY_PARTS_RE = /^(\d{4})-(\d{1,2})-(\d{1,2})$/
 const DAY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.json$/
+
+/**
+ * Canonicalize a loosely formatted day string (YYYY-M-D or YYYY-MM-DD) into a
+ * YYYY-MM-DD key. Only digit-only regex capture groups are re-emitted, so a
+ * request-supplied value can never contribute anything but digits to a usage
+ * file path. Returns null for anything that is not a pure digit key.
+ */
+export function parseDayKey(input: string): string | null {
+  const m = input.trim().match(DAY_PARTS_RE)
+  if (!m) return null
+  return `${m[1]}-${m[2]!.padStart(2, '0')}-${m[3]!.padStart(2, '0')}`
+}
 
 function emptyTotals(): UsageTotals {
   return { requests: 0, success: 0, failures: 0, promptTokens: 0, outputTokens: 0, thoughtsTokens: 0 }
@@ -137,7 +149,7 @@ export class UsageHistory {
     try {
       this.recordInto(stat)
     } catch (error) {
-      log.warn(`usage record failed: ${error instanceof Error ? error.message : String(error)}`)
+      log.warn(`usage record failed: ${errText(error)}`)
     }
   }
 
@@ -153,21 +165,24 @@ export class UsageHistory {
 
   /** Most recent days, newest first. The live in-memory day wins over disk. */
   listDays(limit = 30): DayUsageSummary[] {
+    // Clamp the caller-supplied limit here so no request-derived number
+    // reaches the slicing logic unvalidated.
+    const max = Number.isFinite(limit) ? Math.min(Math.max(1, Math.trunc(limit)), 366) : 30
     const byDate = new Map<string, DayUsageSummary>()
     try {
       const files = fs
         .readdirSync(this.usageDir)
         .filter((name) => DAY_FILE_RE.test(name))
-        .sort()
+        .sort((a, b) => a.localeCompare(b))
         .reverse()
       for (const name of files) {
-        if (byDate.size >= limit) break
-        const day = this.readDayFile(name.slice(0, -'.json'.length))
+        if (byDate.size >= max) break
+        const day = this.readDayFileByName(name)
         if (day) byDate.set(day.date, { date: day.date, totals: day.totals, updatedAt: day.updatedAt })
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
-        log.warn(`usage listing failed: ${error instanceof Error ? error.message : String(error)}`)
+        log.warn(`usage listing failed: ${errText(error)}`)
       }
     }
     if (this.current) {
@@ -177,14 +192,18 @@ export class UsageHistory {
         updatedAt: this.current.updatedAt,
       })
     }
-    return [...byDate.values()].sort((a, b) => b.date.localeCompare(a.date)).slice(0, Math.max(1, limit))
+    return [...byDate.values()].sort((a, b) => b.date.localeCompare(a.date)).slice(0, max)
   }
 
   /** Full breakdown for one day (YYYY-MM-DD); the live in-memory day wins. */
   getDay(date: string): DayUsage | null {
-    if (!DAY_KEY_RE.test(date)) return null
-    if (this.current?.date === date) return this.current
-    return this.readDayFile(date)
+    const key = parseDayKey(date)
+    if (!key) return null
+    if (this.current?.date === key) return this.current
+    // Resolve the canonical key against actual directory entries so the file
+    // path is built only from filesystem names, never from request data.
+    const name = this.findDayFile(key)
+    return name ? this.readDayFileByName(name) : null
   }
 
   // ------------------------------------------------------------- internals --
@@ -211,7 +230,7 @@ export class UsageHistory {
   }
 
   private loadOrStartDay(date: string): DayUsage {
-    const existing = this.readDayFile(date)
+    const existing = this.readDayFileByName(`${date}.json`)
     return (
       existing ?? {
         version: STORE_VERSION,
@@ -226,20 +245,43 @@ export class UsageHistory {
     )
   }
 
-  private readDayFile(date: string): DayUsage | null {
-    // Single choke point guarding every path that reaches the fs with a day key.
-    if (!DAY_KEY_RE.test(date)) return null
+  /**
+   * Directory entry for a canonical day key, if one exists on disk. Returns
+   * the name taken from the listing itself, so callers never build a path
+   * from a request-derived string.
+   */
+  private findDayFile(key: string): string | null {
+    const wanted = `${key}.json`
+    if (!DAY_FILE_RE.test(wanted)) return null
     try {
-      const parsed: unknown = JSON.parse(fs.readFileSync(path.join(this.usageDir, `${date}.json`), 'utf8'))
-      if (!isValidDayShape(parsed) || parsed.date !== date) {
-        log.warn(`usage file for ${date} is malformed; ignoring`)
+      for (const entry of fs.readdirSync(this.usageDir)) {
+        if (entry === wanted) return entry
+      }
+      return null
+    } catch {
+      return null
+    }
+  }
+
+  /** Read one day file by its directory-entry name (never raw request data). */
+  private readDayFileByName(name: string): DayUsage | null {
+    if (!DAY_FILE_RE.test(name)) return null
+    // Same containment rule as the admin page's safeAsset: resolve and prove
+    // the result stayed inside the usage directory.
+    const file = path.resolve(this.usageDir, name)
+    if (!file.startsWith(this.usageDir + path.sep)) return null
+    const key = name.slice(0, -'.json'.length)
+    try {
+      const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf8'))
+      if (!isValidDayShape(parsed) || parsed.date !== key) {
+        log.warn(`usage file for ${key} is malformed; ignoring`)
         return null
       }
       return parsed
     } catch (error) {
       if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
         log.warn(
-          `usage file for ${date} unreadable (${error instanceof Error ? error.message : String(error)}); ignoring`,
+          `usage file for ${key} unreadable (${errText(error)}); ignoring`,
         )
       }
       return null
@@ -251,12 +293,13 @@ export class UsageHistory {
     try {
       fs.mkdirSync(this.usageDir, { recursive: true })
       const file = path.join(this.usageDir, `${day.date}.json`)
+      if (path.dirname(file) !== this.usageDir) return false
       const tmp = `${file}.tmp`
       fs.writeFileSync(tmp, JSON.stringify(day, null, 2) + '\n', { mode: 0o600 })
       fs.renameSync(tmp, file)
       return true
     } catch (error) {
-      log.warn(`usage write failed for ${day.date}: ${error instanceof Error ? error.message : String(error)}`)
+      log.warn(`usage write failed for ${day.date}: ${errText(error)}`)
       return false
     }
   }

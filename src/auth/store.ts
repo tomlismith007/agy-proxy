@@ -8,7 +8,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { aesDecrypt, aesEncrypt, generateMasterKey } from '../util/crypto.js'
-import { createLogger } from '../util/log.js'
+import { createLogger, errText } from '../util/log.js'
 import type { AccountRecord } from '../types.js'
 
 const log = createLogger('store')
@@ -79,7 +79,7 @@ export class AccountStore {
       if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return
       if (error instanceof Error && error.message.includes('unsupported store file')) throw error
       // Corrupt or undecryptable store: start empty rather than crash the CLI/server.
-      log.warn(`account store unreadable (${error instanceof Error ? error.message : String(error)}); starting empty`)
+      log.warn(`account store unreadable (${errText(error)}); starting empty`)
       this.accounts = new Map()
     }
   }

@@ -7,17 +7,16 @@
  * are rejected via an Origin check (CSRF guard).
  */
 
-import fs from 'node:fs'
 import { Hono } from 'hono'
 import type { Context, MiddlewareHandler } from 'hono'
-import type { AccountRecord, AdapterDraft } from '../types.js'
-import type { AppContext } from '../api/chat-handler.js'
+import type { AccountRecord, AdapterDraft, AppContext } from '../types.js'
 import { generateApiKey } from '../util/crypto.js'
 import { persistConfigPatch } from '../config.js'
 import { stats } from '../util/stats.js'
+import { parseDayKey } from '../util/usage-history.js'
 import { GateFullError } from '../util/concurrency.js'
 import { ensureEgressProxy, maskProxyUrl, normalizeProxyUrl, probeProxy } from '../util/urlguard.js'
-import { killFilePath } from '../api/middleware.js'
+import { clearKillSwitch, engageKillSwitch, killSwitchEngaged } from '../killswitch.js'
 import { ensureFreshAccessToken } from '../auth/tokens.js'
 import { LoginManager } from '../auth/login-flow.js'
 import { verifyAccount } from '../pool/health.js'
@@ -32,18 +31,13 @@ import { parseUpstreamResponse } from '../adapters/shared/frame.js'
 import { generateContent } from '../upstream/client.js'
 import { rankAccounts } from '../pool/selector.js'
 import { markSuccess } from '../pool/ratelimit.js'
-import { ClassifiedUpstreamError } from '../pool/classify.js'
+import { ClassifiedUpstreamError } from '../util/classify.js'
+import { errText } from '../util/log.js'
 import { isLoopbackHost } from './page.js'
 import { VERSION } from '../version.js'
 
 function adminToken(): string | undefined {
   return process.env.AGY_ADMIN_TOKEN?.trim() || undefined
-}
-
-/** Extract a usable error message from arbitrary throws. */
-function errText(error: unknown): string {
-  if (error instanceof Error) return error.message
-  return String(error)
 }
 
 async function readJson(c: Context): Promise<Record<string, unknown>> {
@@ -55,6 +49,11 @@ async function readJson(c: Context): Promise<Record<string, unknown>> {
   } catch {
     return {}
   }
+}
+
+/** body.email as a trimmed string ('' when absent or malformed). */
+function emailFromBody(body: Record<string, unknown>): string {
+  return typeof body.email === 'string' ? body.email.trim() : ''
 }
 
 /**
@@ -172,6 +171,18 @@ async function runTestChat(
 export function registerAdminRoutes(app: Hono, ctx: AppContext): void {
   const loginManager = new LoginManager(ctx.store)
 
+  /**
+   * Shared shape of the account-mutation endpoints: read body.email, resolve
+   * the account. Returns the record, or a ready-to-return error Response.
+   */
+  const accountFromBody = (c: Context, body: Record<string, unknown>): AccountRecord | Response => {
+    const email = emailFromBody(body)
+    if (!email) return c.json({ error: '缺少 email' }, 400)
+    const record = ctx.store.get(email)
+    if (!record) return c.json({ error: `未找到账号: ${email}` }, 404)
+    return record
+  }
+
   // ---------------------------------------------------------------- reads --
   app.get('/admin/overview', (c) => {
     const accounts = ctx.store.list()
@@ -183,7 +194,7 @@ export function registerAdminRoutes(app: Hono, ctx: AppContext): void {
       dataDir: ctx.config.dataDir,
       loopback: isLoopbackHost(ctx.config.host),
       accounts: { total: accounts.length, enabled: accounts.filter((a) => a.enabled).length },
-      paused: fs.existsSync(killFilePath(ctx.config.dataDir)),
+      paused: killSwitchEngaged(ctx.config.dataDir),
       proxy: process.env.AGY_PROXY_PROXY?.trim() || null,
       maxConcurrentUpstream: ctx.config.maxConcurrentUpstream,
       activeUpstreamRequests: ctx.upstreamGate.activeCount,
@@ -229,25 +240,21 @@ export function registerAdminRoutes(app: Hono, ctx: AppContext): void {
 
   app.get('/admin/stats', (c) => c.json(stats.snapshot()))
 
-  // Persisted daily usage history (survives restarts), newest first.
-  app.get('/admin/usage/days', (c) => {
-    const raw = Number(c.req.query('limit'))
-    const limit = Number.isFinite(raw) && raw > 0 ? Math.min(Math.trunc(raw), 366) : 30
-    return c.json({ days: ctx.usage.listDays(limit) })
-  })
+  // Persisted daily usage history (survives restarts), newest first. The
+  // window is fixed: the only client (admin console) always asks for 30, so
+  // no request-supplied number reaches the listing logic.
+  app.get('/admin/usage/days', (c) => c.json({ days: ctx.usage.listDays(30) }))
 
   // Full breakdown for one day (models / accounts / hourly trend).
   app.get('/admin/usage/day', (c) => {
-    // Rebuild the key from range-checked numbers so no raw query substring
-    // ever reaches the filesystem layer (path traversal can't survive Number()).
-    const [y, m, d] = (c.req.query('date') ?? '').trim().split('-').map(Number)
-    const valid =
-      Number.isSafeInteger(y) && y >= 2000 && y <= 9999 &&
-      Number.isSafeInteger(m) && m >= 1 && m <= 12 &&
-      Number.isSafeInteger(d) && d >= 1 && d <= 31
-    if (!valid) return c.json({ error: 'date 需为 YYYY-MM-DD 格式' }, 400)
-    const date = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`
-    const day = ctx.usage.getDay(date)
+    // The request value is canonicalized and then only ever *compared*
+    // against dates the persisted listing itself produced. The filesystem
+    // layer receives an fs-sourced key, never a request-derived string.
+    const date = parseDayKey(c.req.query('date') ?? '')
+    if (!date) return c.json({ error: 'date 需为 YYYY-MM-DD 格式' }, 400)
+    const listed = ctx.usage.listDays(366).find((d) => d.date === date)
+    if (!listed) return c.json({ error: `未找到该日期的用量记录：${date}` }, 404)
+    const day = ctx.usage.getDay(listed.date)
     if (!day) return c.json({ error: `未找到该日期的用量记录：${date}` }, 404)
     return c.json(day)
   })
@@ -380,25 +387,22 @@ export function registerAdminRoutes(app: Hono, ctx: AppContext): void {
 
   app.post('/admin/accounts/toggle', async (c) => {
     const body = await readJson(c)
-    const email = typeof body.email === 'string' ? body.email.trim() : ''
-    if (!email) return c.json({ error: '缺少 email' }, 400)
-    const target = ctx.store.get(email)
-    if (!target) return c.json({ error: `未找到账号: ${email}` }, 404)
+    const target = accountFromBody(c, body)
+    if (target instanceof Response) return target
     const enabled = typeof body.enabled === 'boolean' ? body.enabled : !target.enabled
-    ctx.store.update(email, (r) => {
+    ctx.store.update(target.email, (r) => {
       r.enabled = enabled
       if (enabled) {
         r.consecutiveInvalidGrant = 0
       }
     })
-    return c.json({ ok: true, email, enabled })
+    return c.json({ ok: true, email: target.email, enabled })
   })
 
   app.post('/admin/accounts/remove', async (c) => {
-    const body = await readJson(c)
-    const email = typeof body.email === 'string' ? body.email.trim() : ''
-    if (!email) return c.json({ error: '缺少 email' }, 400)
-    if (!ctx.store.remove(email)) return c.json({ error: `未找到账号: ${email}` }, 404)
+    const target = accountFromBody(c, await readJson(c))
+    if (target instanceof Response) return target
+    if (!ctx.store.remove(target.email)) return c.json({ error: `未找到账号: ${target.email}` }, 404)
     return c.json({
       ok: true,
       note: '本地账号已删除；Google 侧授权不会自动撤销，如需彻底撤销请访问 https://myaccount.google.com/permissions',
@@ -406,8 +410,7 @@ export function registerAdminRoutes(app: Hono, ctx: AppContext): void {
   })
 
   app.post('/admin/accounts/verify', async (c) => {
-    const body = await readJson(c)
-    const email = typeof body.email === 'string' ? body.email.trim() : ''
+    const email = emailFromBody(await readJson(c))
     const target = email ? ctx.store.get(email) : ctx.store.list().find((r) => r.enabled)
     if (!target) return c.json({ error: email ? `未找到账号: ${email}` : '没有可用账号' }, 404)
     // Shared probe path with the CLI + background loop; clears recoverable
@@ -418,9 +421,8 @@ export function registerAdminRoutes(app: Hono, ctx: AppContext): void {
   // ------------------------------------------------- per-account egress proxy --
   app.post('/admin/accounts/proxy', async (c) => {
     const body = await readJson(c)
-    const email = typeof body.email === 'string' ? body.email.trim() : ''
-    const target = ctx.store.get(email)
-    if (!target) return c.json({ error: `未找到账号: ${email}` }, 404)
+    const target = accountFromBody(c, body)
+    if (target instanceof Response) return target
     let normalized: string | undefined
     if (typeof body.proxyUrl === 'string' && body.proxyUrl.trim() !== '') {
       try {
@@ -431,25 +433,22 @@ export function registerAdminRoutes(app: Hono, ctx: AppContext): void {
     } else if (body.proxyUrl !== null && body.proxyUrl !== undefined) {
       return c.json({ error: 'proxyUrl 需为字符串（http/https URL）或 null' }, 400)
     }
-    ctx.store.update(email, (r) => {
+    ctx.store.update(target.email, (r) => {
       r.proxyUrl = normalized
     })
-    return c.json({ ok: true, email, proxyMasked: maskProxyUrl(normalized) ?? null })
+    return c.json({ ok: true, email: target.email, proxyMasked: maskProxyUrl(normalized) ?? null })
   })
 
   app.post('/admin/accounts/proxy/test', async (c) => {
-    const body = await readJson(c)
-    const email = typeof body.email === 'string' ? body.email.trim() : ''
-    const target = ctx.store.get(email)
-    if (!target) return c.json({ error: `未找到账号: ${email}` }, 404)
+    const target = accountFromBody(c, await readJson(c))
+    if (target instanceof Response) return target
     if (!target.proxyUrl) return c.json({ ok: false, error: '该账号未绑定代理' })
     // Real request through the bound path to a fixed fast endpoint.
     return c.json(await probeProxy(target.proxyUrl))
   })
 
   app.post('/admin/quota/refresh', async (c) => {
-    const body = await readJson(c)
-    const email = typeof body.email === 'string' ? body.email.trim() : ''
+    const email = emailFromBody(await readJson(c))
     const targets = email
       ? [ctx.store.get(email)].filter((r): r is AccountRecord => Boolean(r))
       : ctx.store.list().filter((r) => r.enabled)
@@ -502,13 +501,12 @@ export function registerAdminRoutes(app: Hono, ctx: AppContext): void {
 
   // ---------------------------------------------------------- kill switch --
   app.post('/admin/pause', (c) => {
-    fs.writeFileSync(killFilePath(ctx.config.dataDir), new Date().toISOString(), { mode: 0o600 })
+    engageKillSwitch(ctx.config.dataDir)
     return c.json({ ok: true, paused: true })
   })
 
   app.post('/admin/resume', (c) => {
-    const file = killFilePath(ctx.config.dataDir)
-    if (fs.existsSync(file)) fs.unlinkSync(file)
+    clearKillSwitch(ctx.config.dataDir)
     return c.json({ ok: true, paused: false })
   })
 

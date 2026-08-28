@@ -9,10 +9,11 @@
  * serialized with jittered inter-account delays — never a parallel fan-out.
  */
 
-import type { AppContext } from '../api/chat-handler.js'
+import type { AppContext } from '../types.js'
 import { refreshAccountQuota } from '../upstream/discovery.js'
-import { isQuotaStale } from './quota.js'
-import { createLogger } from '../util/log.js'
+import { isQuotaStale } from '../util/quota.js'
+import { createLogger, errText } from '../util/log.js'
+import { sleep } from '../util/concurrency.js'
 
 const log = createLogger('quota')
 
@@ -21,10 +22,6 @@ const TICK_INTERVAL_MS = 30_000
 const FAILURE_RETRY_MS = 60_000
 /** Jittered pause between refreshing different accounts in one pass. */
 const INTER_ACCOUNT_DELAY_MS = 1_500
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
 
 export interface QuotaRefresher {
   stop(): void
@@ -52,9 +49,7 @@ export function startQuotaRefresher(ctx: AppContext): QuotaRefresher {
           log.debug(`background quota refresh ok: ${record.email}`)
         } catch (error) {
           lastFailedAttemptAt.set(record.email, Date.now())
-          log.warn(
-            `background quota refresh failed for ${record.email}: ${error instanceof Error ? error.message : String(error)}`,
-          )
+          log.warn(`background quota refresh failed for ${record.email}: ${errText(error)}`)
         }
         // Spread accounts out; a burst of discovery calls is its own signal.
         await sleep(INTER_ACCOUNT_DELAY_MS + Math.floor(Math.random() * 1_000))

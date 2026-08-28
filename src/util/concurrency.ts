@@ -68,3 +68,25 @@ export class Semaphore {
     if (next) next()
   }
 }
+
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Try each candidate in order; the first defined result wins. tryFn handles
+ * its own per-candidate failures (resolve undefined to skip to the next) and
+ * only throws to abort the whole sequence (caller aborts, hard timeouts).
+ * Resolves undefined when every candidate was skipped — the caller owns the
+ * all-failed behavior.
+ */
+export async function firstSuccessful<T, R>(
+  candidates: readonly T[],
+  tryFn: (item: T) => Promise<R | undefined>,
+): Promise<R | undefined> {
+  for (const item of candidates) {
+    const value = await tryFn(item)
+    if (value !== undefined) return value
+  }
+  return undefined
+}

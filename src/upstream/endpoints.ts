@@ -6,6 +6,7 @@
 
 import { safeFetch } from '../util/urlguard.js'
 import { paceUpstreamCall } from '../util/pacer.js'
+import { firstSuccessful } from '../util/concurrency.js'
 
 const AGY_ENDPOINT_DAILY = 'https://daily-cloudcode-pa.googleapis.com'
 const AGY_ENDPOINT_PROD = 'https://cloudcode-pa.googleapis.com'
@@ -43,7 +44,7 @@ export async function postAcrossEndpoints(
 ): Promise<EndpointAttempt> {
   let lastSkipped: Response | null = null
   let lastSkippedBase = ''
-  for (const baseEndpoint of AGY_ENDPOINT_FALLBACKS) {
+  const attempt = await firstSuccessful(AGY_ENDPOINT_FALLBACKS, async (baseEndpoint) => {
     if (externalSignal?.aborted) throw new DOMException('aborted by caller', 'AbortError')
     // Pace BEFORE arming the per-attempt timeout so the wait doesn't eat
     // into the request's own time budget.
@@ -64,11 +65,13 @@ export async function postAcrossEndpoints(
       }
       lastSkipped = response
       lastSkippedBase = baseEndpoint
+      return undefined
     } catch (error) {
       if (error instanceof Error && error.name === 'TimeoutError') throw error
-      // network error — try next endpoint
+      return undefined // network error — try next endpoint
     }
-  }
+  })
+  if (attempt) return attempt
   if (lastSkipped) return { response: lastSkipped, baseEndpoint: lastSkippedBase }
   throw new Error('all Antigravity endpoints failed')
 }

@@ -14,7 +14,8 @@ import type { AccountRecord } from '../types.js'
 import type { AccountStore } from '../auth/store.js'
 import { ensureFreshAccessToken } from '../auth/tokens.js'
 import { loadCodeAssist } from '../auth/bootstrap.js'
-import { createLogger } from '../util/log.js'
+import { createLogger, errText } from '../util/log.js'
+import { sleep } from '../util/concurrency.js'
 
 const log = createLogger('health')
 
@@ -47,11 +48,6 @@ function noteProbeResult(email: string, ok: boolean, now = Date.now()): void {
   state.lastProbeAt = now
   state.consecutiveFailures = ok ? 0 : state.consecutiveFailures + 1
   probeStateByEmail.set(email, state)
-}
-
-/** Test-only: forget all probe bookkeeping. */
-export function resetHealthState(): void {
-  probeStateByEmail.clear()
 }
 
 /** Whether the background loop may auto-probe this account right now. */
@@ -125,7 +121,7 @@ export async function verifyAccount(store: AccountStore, email: string): Promise
     log.info(`health probe ${email}: ok`)
     return { ok: true, email, projectId: assist.projectId, tierId: assist.tierId }
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = errText(error)
     noteProbeResult(email, false)
     store.update(email, (r) => {
       r.lastHealthAt = Date.now()
@@ -168,14 +164,14 @@ export function startHealthLoop(store: AccountStore): HealthLoop {
     const candidates = pickProbeTargets(store)
     for (const record of candidates) {
       if (stopped) return
-      await new Promise((resolve) => setTimeout(resolve, 2_000))
+      await sleep(2_000)
       await verifyAccount(store, record.email)
     }
   }
 
   const run = (): void => {
     void probePass().catch((error) => {
-      log.warn(`health pass aborted: ${error instanceof Error ? error.message : String(error)}`)
+      log.warn(`health pass aborted: ${errText(error)}`)
     })
   }
 

@@ -21,7 +21,7 @@ const {
   FULL_QUOTA_COOLDOWN_MS,
   VALIDATION_BLOCK_COOLDOWN_MS,
 } = await import('../dist/pool/ratelimit.js')
-const { classifyHttpError, classifyRateLimit } = await import('../dist/pool/classify.js')
+const { classifyHttpError, classifyRateLimit } = await import('../dist/util/classify.js')
 const { Semaphore, GateFullError } = await import('../dist/util/concurrency.js')
 const { paceUpstreamCall, resetPacer, MIN_INTERVAL_MS } = await import('../dist/util/pacer.js')
 const { pickFingerprint } = await import('../dist/upstream/fingerprint.js')
@@ -236,7 +236,7 @@ function account(overrides = {}) {
 // --- 9. per-account proxy fail-closed gating ------------------------------------------
 {
   const { isProxyPathOutage } = await import('../dist/pool/ratelimit.js')
-  const { classifyFetchError } = await import('../dist/pool/classify.js')
+  const { classifyFetchError } = await import('../dist/util/classify.js')
 
   assert.equal(isProxyPathOutage('network-error', true), true, 'proxy-bound + connect error → skip cooldown bookkeeping')
   assert.equal(isProxyPathOutage('network-error', false), false, 'unbound account → normal rotation engine')
@@ -256,7 +256,7 @@ function account(overrides = {}) {
 
   // ClassifiedUpstreamError preserves validationUrl across the throw boundary
   // so decideRotationFromClassified can still record re-validation links.
-  const { ClassifiedUpstreamError } = await import('../dist/pool/classify.js')
+  const { ClassifiedUpstreamError } = await import('../dist/util/classify.js')
   const carried = new ClassifiedUpstreamError({
     kind: 'validation-blocked',
     status: 403,

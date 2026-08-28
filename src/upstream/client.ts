@@ -7,9 +7,10 @@
 
 import { AGY_ENDPOINT_FALLBACKS, postAcrossEndpoints } from './endpoints.js'
 import { getBootstrapUserAgent, getClientMetadataHeader, getGenerationUserAgent, getXGoogApiClient } from './fingerprint.js'
-import { classifyFetchError, classifyHttpError, ClassifiedUpstreamError } from '../pool/classify.js'
+import { unwrapResponseEnvelope } from './envelope.js'
+import { classifyFetchError, classifyHttpError, ClassifiedUpstreamError } from '../util/classify.js'
 import { safeFetch } from '../util/urlguard.js'
-import { unwrapResponseEnvelope } from '../adapters/shared/frame.js'
+import { firstSuccessful } from '../util/concurrency.js'
 import { createLogger } from '../util/log.js'
 import type { DiscoveredModels } from '../types.js'
 import type { Envelope, UpstreamResponse } from '../types.js'
@@ -169,28 +170,25 @@ export async function fetchAvailableModels(
   }
   const body = JSON.stringify(projectId ? { project: projectId } : {})
   let lastClassified: ClassifiedUpstreamError | undefined
-  for (const base of AGY_ENDPOINT_FALLBACKS) {
+  const discovered = await firstSuccessful(AGY_ENDPOINT_FALLBACKS, async (base) => {
     try {
       const response = await safeFetch(`${base}/v1internal:fetchAvailableModels`, {
         method: 'POST',
         headers,
         body,
-        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
+        timeoutMs: DISCOVERY_TIMEOUT_MS,
         ...(identity.proxyUrl ? { agyProxy: identity.proxyUrl } : {}),
       })
-      if (response.ok) {
-        return (await response.json()) as DiscoveredModels
-      }
+      if (response.ok) return (await response.json()) as DiscoveredModels
       lastClassified = new ClassifiedUpstreamError(
         classifyHttpError(response.status, response.headers, await readBodyText(response)),
       )
     } catch (error) {
-      if (error instanceof ClassifiedUpstreamError) {
-        lastClassified = error
-      } else {
-        lastClassified = new ClassifiedUpstreamError(classifyFetchError(error))
-      }
+      lastClassified =
+        error instanceof ClassifiedUpstreamError ? error : new ClassifiedUpstreamError(classifyFetchError(error))
     }
-  }
+    return undefined
+  })
+  if (discovered) return discovered
   throw lastClassified ?? new Error('fetchAvailableModels: all endpoints failed')
 }

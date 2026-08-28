@@ -13,10 +13,6 @@ export function generateApiKey(): string {
   return `sk-agy-${crypto.randomBytes(24).toString('base64url')}`
 }
 
-export function sha256Hex(input: string): string {
-  return crypto.createHash('sha256').update(input, 'utf8').digest('hex')
-}
-
 function keyFrom(masterKeyB64: string): Buffer {
   const key = Buffer.from(masterKeyB64, 'base64')
   if (key.length !== 32) {

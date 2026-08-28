@@ -5,44 +5,30 @@
  */
 
 import type { Context } from 'hono'
-import type { AppConfig } from '../config.js'
-import type { AccountStore } from '../auth/store.js'
 import { ensureFreshAccessToken, RefreshError } from '../auth/tokens.js'
 import { beginStreamGenerateContent, countUpstreamTokens, generateContent, type UpstreamIdentity } from '../upstream/client.js'
 import { finalizeEnvelope } from '../adapters/shared/finalize.js'
 import { ANTHROPIC_FORMAT } from '../adapters/anthropic/format.js'
 import { ApiError, type ClientErrorPayload } from '../adapters/shared/errors.js'
 import type { ClientFormatSpec, FormatContext, ParsedClientRequest } from '../adapters/shared/format-spec.js'
-import { ClassifiedUpstreamError } from '../pool/classify.js'
+import { ClassifiedUpstreamError } from '../util/classify.js'
 import { decideRotationFromClassified, isProxyPathOutage, markSuccess } from '../pool/ratelimit.js'
 import { rankAccounts } from '../pool/selector.js'
 import { applyAffinity, clearAffinity, pinAccount } from '../pool/affinity.js'
 import { sseResponse } from '../util/sse-writer.js'
-import { GateFullError, type Semaphore } from '../util/concurrency.js'
+import { GateFullError, sleep } from '../util/concurrency.js'
 import { stats, type RequestStat } from '../util/stats.js'
 import type { UsageHistory } from '../util/usage-history.js'
 import { decodeStreamFrame, opaqueId, parseUpstreamResponse } from '../adapters/shared/frame.js'
 import type { SseEvent } from '../upstream/sse.js'
-import type { UsageMetadata } from '../types.js'
+import { errText } from '../util/log.js'
+import type { AppContext, UsageMetadata } from '../types.js'
 import { createLogger } from '../util/log.js'
 
 const log = createLogger('chat')
 
-export interface AppContext {
-  config: AppConfig
-  store: AccountStore
-  /** Bounds simultaneous upstream calls (risk-control pacing). */
-  upstreamGate: Semaphore
-  /** Persistent per-day usage history backing the admin console's daily view. */
-  usage: UsageHistory
-}
-
 /** Total upstream attempts per request across the pool. */
 const MAX_TOTAL_ATTEMPTS = 5
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
 
 function errorResponse(c: Context, payload: ClientErrorPayload): Response {
   return c.json(payload.body, { status: payload.status } as never)
@@ -74,7 +60,7 @@ function trackStreamUsage(
         yield event
       }
     } catch (error) {
-      settle(usage, error instanceof Error ? error.message : String(error))
+      settle(usage, errText(error))
       throw error
     }
     settle(usage, undefined)
@@ -124,7 +110,7 @@ export async function handleChatRequest(
       finishStat(error.status, false, { error: error.message })
       return errorResponse(c, format.errorPayload(error.status, error.code, error.message))
     }
-    log.warn(`parse failed: ${error instanceof Error ? error.message : String(error)}`)
+    log.warn(`parse failed: ${errText(error)}`)
     finishStat(400, false, { error: 'malformed request body' })
     return errorResponse(c, format.errorPayload(400, 'invalid_request_error', 'malformed request body'))
   }
@@ -181,7 +167,7 @@ export async function handleChatRequest(
     try {
       call = finalizeEnvelope(draft, { accountKey: email, projectId: record.projectId })
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'empty conversation'
+      const message = errText(error) || 'empty conversation'
       finishStat(400, false, { error: message })
       return errorResponse(c, format.errorPayload(400, 'invalid_request_error', message))
     }
@@ -244,7 +230,7 @@ export async function handleChatRequest(
       return sseResponse(frames)
     } catch (error) {
       if (!(error instanceof ClassifiedUpstreamError)) {
-        const message = error instanceof Error ? error.message : String(error)
+        const message = errText(error)
         log.error(`unexpected failure on ${email}: ${message}`)
         lastPayload = format.errorPayload(500, 'internal_error', message)
         break
@@ -373,7 +359,7 @@ export async function handleCountTokensRequest(ctx: AppContext, c: Context): Pro
     if (error instanceof ClassifiedUpstreamError) {
       return errorResponse(c, anthropic.upstreamPayload(error.kind, error.message))
     }
-    const message = error instanceof Error ? error.message : String(error)
+    const message = errText(error)
     log.warn(`count_tokens failed: ${message}`)
     return errorResponse(c, anthropic.errorPayload(500, 'api_error', message))
   } finally {

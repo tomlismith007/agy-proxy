@@ -1,7 +1,12 @@
 /**
  * Shared type definitions: account store records, upstream wire shapes,
- * client-facing adapter drafts.
+ * client-facing adapter drafts, and the runtime AppContext.
  */
+
+import type { AppConfig } from './config.js'
+import type { AccountStore } from './auth/store.js'
+import type { Semaphore } from './util/concurrency.js'
+import type { UsageHistory } from './util/usage-history.js'
 
 // ---------------------------------------------------------------------------
 // Account store
@@ -216,4 +221,18 @@ export interface ClassifiedError {
   validationUrl?: string
   /** Undici connect-layer code from the cause chain (ECONNREFUSED, UND_ERR_CONNECT_TIMEOUT, …). */
   connectCode?: string
+}
+
+// ---------------------------------------------------------------------------
+// Runtime context (defined here so lower layers can depend on it without
+// reaching up into the api/ composition layer)
+// ---------------------------------------------------------------------------
+
+export interface AppContext {
+  config: AppConfig
+  store: AccountStore
+  /** Bounds simultaneous upstream calls (risk-control pacing). */
+  upstreamGate: Semaphore
+  /** Persistent per-day usage history backing the admin console's daily view. */
+  usage: UsageHistory
 }

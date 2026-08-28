@@ -3,17 +3,11 @@
  * and lightweight request logging.
  */
 
-import fs from 'node:fs'
-import path from 'node:path'
 import type { Context, MiddlewareHandler } from 'hono'
+import { killSwitchEngaged } from '../killswitch.js'
 import { createLogger, redactSecrets } from '../util/log.js'
 
 const log = createLogger('http')
-
-/** Path of the kill-switch sentinel file inside the data directory. */
-export function killFilePath(dataDir: string): string {
-  return path.join(dataDir, 'KILL')
-}
 
 /**
  * Emergency hot stop: while `<dataDir>/KILL` exists every /v1/* request is
@@ -22,7 +16,7 @@ export function killFilePath(dataDir: string): string {
  */
 export function killSwitchMiddleware(dataDir: string): MiddlewareHandler {
   return async (c, next) => {
-    if (fs.existsSync(killFilePath(dataDir))) {
+    if (killSwitchEngaged(dataDir)) {
       return c.json(
         {
           error: {

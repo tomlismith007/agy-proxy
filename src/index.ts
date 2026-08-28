@@ -4,12 +4,16 @@
  * verification and the local serving daemon.
  */
 
-import fs from 'node:fs'
 import readline from 'node:readline/promises'
 import { Command } from 'commander'
 import { loadConfig, resolveDataDir } from './config.js'
 import { openStore } from './auth/store.js'
-import { buildAuthorizationUrl, decodeState, ensureClientSecret } from './auth/oauth.js'
+import {
+  buildAuthorizationUrl,
+  decodeState,
+  DEFAULT_CALLBACK_PORT,
+  ensureClientSecret,
+} from './auth/oauth.js'
 import {
   completeLogin,
   findFreePort,
@@ -21,12 +25,12 @@ import { ensureFreshAccessToken } from './auth/tokens.js'
 import { fetchAvailableModels } from './upstream/client.js'
 import { isChatCallableModelId } from './upstream/catalog.js'
 import { DEFAULT_HEALTH_INTERVAL_MS, pickProbeTargets, verifyAccount, type VerifyResult } from './pool/health.js'
-import { killFilePath } from './api/middleware.js'
+import { clearKillSwitch, engageKillSwitch, killSwitchEngaged } from './killswitch.js'
 import { startServer } from './server.js'
 import { VERSION } from './version.js'
 import { ensureEgressProxy, maskProxyUrl, normalizeProxyUrl, probeProxy } from './util/urlguard.js'
 import { loadFingerprintOverrides } from './upstream/fingerprint.js'
-import { createLogger } from './util/log.js'
+import { createLogger, errText } from './util/log.js'
 import { UsageHistory, type DayUsage } from './util/usage-history.js'
 import type { AccountRecord } from './types.js'
 
@@ -76,17 +80,19 @@ program
   .command('login')
   .description('Log in with a Google account (browser OAuth, or paste mode with --headless)')
   .option('--headless', 'print the authorize URL and wait for a pasted redirect URL')
-  .option('--port <port>', 'loopback callback port', '51121')
+  .option('--port <port>', 'loopback callback port', String(DEFAULT_CALLBACK_PORT))
   .action(async (options: { headless?: boolean; port: string }) => {
     // Resolve egress proxy before any network work (token exchange, userinfo,
     // bootstrap) — direct connectivity to Google is often unavailable.
     const proxyInUse = await ensureEgressProxy(loadConfig().proxy)
     if (proxyInUse) console.log(`· 出站代理: ${proxyInUse}`)
 
-    const requestedPort = Number(options.port) || 51121
-    const port = requestedPort === 51121 ? await findFreePort(requestedPort) : requestedPort
+    const requestedPort = Number(options.port) || DEFAULT_CALLBACK_PORT
+    const port = requestedPort === DEFAULT_CALLBACK_PORT ? await findFreePort(requestedPort) : requestedPort
     const redirectUri =
-      port === 51121 ? 'http://localhost:51121/oauth-callback' : `http://localhost:${port}/oauth-callback`
+      port === DEFAULT_CALLBACK_PORT
+        ? `http://localhost:${DEFAULT_CALLBACK_PORT}/oauth-callback`
+        : `http://localhost:${port}/oauth-callback`
     const authRequest = buildAuthorizationUrl(redirectUri)
 
     // Provision the public OAuth client credentials up front (env override →
@@ -161,7 +167,7 @@ program
       console.log('  agy-proxy models   # 查看可用模型')
       console.log('  agy-proxy serve    # 启动本地网关（OpenAI + Anthropic 兼容接口）')
     } catch (error) {
-      console.error(`✗ 登录失败: ${error instanceof Error ? error.message : String(error)}`)
+      console.error(`✗ 登录失败: ${errText(error)}`)
       process.exitCode = 1
     }
   })
@@ -220,7 +226,7 @@ program
         console.log(`  ${id.padEnd(34)} 剩余 ${pct.padStart(4)}  重置 ${reset}`)
       }
     } catch (error) {
-      console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
+      console.error(`✗ ${errText(error)}`)
       process.exitCode = 1
     }
   })
@@ -250,7 +256,7 @@ program
         process.exitCode = 1
       }
     } catch (error) {
-      console.error(`✗ 验证失败: ${error instanceof Error ? error.message : String(error)}`)
+      console.error(`✗ 验证失败: ${errText(error)}`)
       process.exitCode = 1
     }
   })
@@ -288,7 +294,7 @@ program
           }
         }
         void tick().catch((error) => {
-          console.warn(`⚠ 探测轮次中断: ${error instanceof Error ? error.message : String(error)}`)
+          console.warn(`⚠ 探测轮次中断: ${errText(error)}`)
         })
         // Active interval ref keeps the process alive until Ctrl+C.
         setInterval(() => void tick(), intervalMs)
@@ -312,7 +318,7 @@ program
       }
       if (failures > 0) process.exitCode = 1
     } catch (error) {
-      console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
+      console.error(`✗ ${errText(error)}`)
       process.exitCode = 1
     }
   })
@@ -344,7 +350,7 @@ proxyCmd
       })
       console.log(`✓ 已设置 ${email} 的出站代理：${maskProxyUrl(normalized)}`)
     } catch (error) {
-      console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
+      console.error(`✗ ${errText(error)}`)
       process.exitCode = 1
     }
   })
@@ -384,7 +390,7 @@ proxyCmd
         process.exitCode = 1
       }
     } catch (error) {
-      console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
+      console.error(`✗ ${errText(error)}`)
       process.exitCode = 1
     }
   })
@@ -423,7 +429,7 @@ program
   .command('pause')
   .description('Engage the kill switch: all /v1/* requests refuse until resume (no restart needed)')
   .action(() => {
-    fs.writeFileSync(killFilePath(resolveDataDir()), new Date().toISOString(), { mode: 0o600 })
+    engageKillSwitch(resolveDataDir())
     console.log('⏸  已暂停：所有 /v1/* 请求将返回 503，上游零流量。')
     console.log('   运行 `agy-proxy resume` 恢复（无需重启服务）。')
   })
@@ -432,11 +438,11 @@ program
   .command('resume')
   .description('Lift the kill switch and restore normal serving')
   .action(() => {
-    if (!fs.existsSync(killFilePath(resolveDataDir()))) {
+    if (!killSwitchEngaged(resolveDataDir())) {
       console.log('当前未处于暂停状态。')
       return
     }
-    fs.unlinkSync(killFilePath(resolveDataDir()))
+    clearKillSwitch(resolveDataDir())
     console.log('▶ 已恢复：/v1/* 正常服务。')
   })
 
@@ -525,7 +531,7 @@ program
   })
 
 const parsed = program.parseAsync(process.argv).catch((error) => {
-  console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
+  console.error(`✗ ${errText(error)}`)
   process.exitCode = 1
 })
 void parsed

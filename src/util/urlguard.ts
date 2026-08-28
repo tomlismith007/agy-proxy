@@ -20,7 +20,7 @@ import { promises as dns } from 'node:dns'
 import net from 'node:net'
 import { fetch as undiciFetch, ProxyAgent } from 'undici'
 import type { RequestInit as UndiciRequestInit } from 'undici'
-import { createLogger } from './log.js'
+import { createLogger, errText } from './log.js'
 
 const log = createLogger('urlguard')
 
@@ -183,10 +183,7 @@ async function assertSafeHostResolved(url: URL): Promise<void> {
   try {
     resolved = await dns.lookup(host, { all: true, verbatim: true })
   } catch (error) {
-    throw new OutboundUrlBlockedError(
-      url.toString(),
-      `dns resolution failed: ${error instanceof Error ? error.message : String(error)}`,
-    )
+    throw new OutboundUrlBlockedError(url.toString(), `dns resolution failed: ${errText(error)}`)
   }
   if (resolved.length === 0) {
     throw new OutboundUrlBlockedError(url.toString(), 'dns resolved to no addresses')
@@ -300,6 +297,11 @@ export interface SafeFetchInit extends RequestInit {
    * proxy when set. Used to honor per-account proxy bindings.
    */
   agyProxy?: string
+  /**
+   * Arm AbortSignal.timeout when the init carries no explicit signal.
+   * An explicit `signal` always wins.
+   */
+  timeoutMs?: number
 }
 
 /** Per-proxy dispatcher cache; bounded so bad configs cannot leak agents. */
@@ -394,7 +396,7 @@ export async function probeProxy(
     }
     return { ok: false, error: `代理可达但出口探测返回 HTTP ${response.status}` }
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    return { ok: false, error: errText(error) }
   } finally {
     try {
       await agent?.close()
@@ -406,7 +408,10 @@ export async function probeProxy(
 
 export async function safeFetch(input: string | URL, init?: SafeFetchInit): Promise<Response> {
   const url = assertSafeOutboundUrl(input)
-  const { agyProxy, ...rest } = init ?? {}
+  const { agyProxy, timeoutMs, ...rest } = init ?? {}
+  if (rest.signal === undefined && timeoutMs !== undefined) {
+    rest.signal = AbortSignal.timeout(timeoutMs)
+  }
   const explicit = agyProxy?.trim()
   if (explicit) {
     // Per-request proxy path: resolution happens at the proxy, so the local

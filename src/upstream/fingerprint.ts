@@ -248,7 +248,7 @@ async function refreshVersionPool(): Promise<boolean> {
   for (const feed of versionFeeds) {
     try {
       const response = await safeFetch(feed, {
-        signal: AbortSignal.timeout(VERSION_FETCH_TIMEOUT_MS),
+        timeoutMs: VERSION_FETCH_TIMEOUT_MS,
         headers: { Accept: 'application/json' },
       })
       if (!response.ok) continue

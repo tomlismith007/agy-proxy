@@ -3,15 +3,15 @@
  */
 
 import { ApiError, expectString } from '../shared/errors.js'
-import { sanitizeTools } from '../shared/tools.js'
+import { sanitizedToolSet } from '../shared/tools.js'
 import {
   assertAcceptedImageMime,
-  buildUpstreamContents,
+  assembleDraft,
   type NormalMessage,
   type ToolCallDraft,
   type UserPart,
 } from '../shared/contents.js'
-import type { AdapterDraft } from '../../types.js'
+import type { AdapterDraft, GenerationConfig } from '../../types.js'
 
 interface RawContentBlock {
   type?: unknown
@@ -187,27 +187,23 @@ export function parseAnthropicMessagesRequest(body: unknown): AnthropicParsedReq
   }
 
   // Tools
-  let declarations: AdapterDraft['declarations']
-  let toolNameMap: Map<string, string> | undefined
-  if (Array.isArray(raw.tools) && raw.tools.length > 0) {
-    const flat = raw.tools.map((tool) => {
-      if (!tool || typeof tool !== 'object') {
-        throw new ApiError(400, 'invalid_request_error', 'tools entries must be objects')
-      }
-      const record = tool as Record<string, unknown>
-      return {
-        name: record.name,
-        description: record.description,
-        input_schema: record.input_schema,
-        parameters: undefined,
-      }
-    })
-    const sanitized = sanitizeTools(flat)
-    if (sanitized.declarations.length > 0) {
-      declarations = sanitized.declarations
-      toolNameMap = sanitized.nameMap
-    }
-  }
+  const tools =
+    Array.isArray(raw.tools) && raw.tools.length > 0
+      ? sanitizedToolSet(
+          raw.tools.map((tool) => {
+            if (!tool || typeof tool !== 'object') {
+              throw new ApiError(400, 'invalid_request_error', 'tools entries must be objects')
+            }
+            const record = tool as Record<string, unknown>
+            return {
+              name: record.name,
+              description: record.description,
+              input_schema: record.input_schema,
+              parameters: undefined,
+            }
+          }),
+        )
+      : undefined
 
   // Thinking parameter -> coarse effort (used only by level-thinking models).
   let reasoningEffort: AdapterDraft['reasoningEffort']
@@ -220,20 +216,11 @@ export function parseAnthropicMessagesRequest(body: unknown): AnthropicParsedReq
     reasoningEffort = budgetToEffort(typeof budget === 'number' && Number.isFinite(budget) ? budget : 16_384)
   }
 
-  const built = buildUpstreamContents(messages)
-
-  return {
-    model,
-    contents: built.contents,
-    systemInstructionText: built.systemText,
-    declarations,
-    ...(toolNameMap ? { toolNameMap } : {}),
-    generationConfig: {
-      ...(typeof raw.temperature === 'number' ? { temperature: raw.temperature } : {}),
-      ...(typeof raw.top_p === 'number' ? { topP: raw.top_p } : {}),
-      maxOutputTokens: maxTokens,
-    },
-    ...(reasoningEffort ? { reasoningEffort } : {}),
-    stream: raw.stream === true,
+  const generationConfig: GenerationConfig = {
+    ...(typeof raw.temperature === 'number' ? { temperature: raw.temperature } : {}),
+    ...(typeof raw.top_p === 'number' ? { topP: raw.top_p } : {}),
+    maxOutputTokens: maxTokens,
   }
+
+  return assembleDraft(model, messages, tools, generationConfig, reasoningEffort, raw.stream === true)
 }

@@ -5,12 +5,9 @@
  */
 
 import type { AccountRecord, ClassifiedError, FailureKind, RateLimitCategory } from '../types.js'
-import { familyKeyOf } from './quota.js'
+import { familyKeyOf } from '../util/quota.js'
 
 export const BACKOFF_TIERS_MS = [5_000, 10_000, 20_000, 30_000, 60_000] as const
-
-/** Below this remaining fraction the family counts as soft-quota-exhausted. */
-export const SOFT_QUOTA_THRESHOLD = 0.15
 
 /** Cooldown for a fully exhausted quota window when no reset time is reported. */
 export const FULL_QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1000

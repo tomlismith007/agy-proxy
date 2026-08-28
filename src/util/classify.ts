@@ -2,8 +2,12 @@
  * Upstream failure classification: HTTP status + headers + body → FailureKind.
  * Conservative: only auth-failure may disable an account; everything else
  * cools, rotates or retries.
+ *
+ * Lives in util/ (not pool/) because the upstream client classifies failures
+ * at the source and lower layers must not depend on pool scheduling modules.
  */
 
+import { errText } from './log.js'
 import type { ClassifiedError, RateLimitCategory } from '../types.js'
 
 const QUOTA_EXHAUSTED_KEYWORDS = [
@@ -137,7 +141,7 @@ export function classifyHttpError(status: number, headers: Headers, bodyText?: s
 
 /** Classify a fetch-level failure (DNS, refused, timeout, abort). */
 export function classifyFetchError(error: unknown): ClassifiedError {
-  const message = error instanceof Error ? error.message : String(error)
+  const message = errText(error)
   if (error instanceof Error && error.name === 'TimeoutError') {
     return { kind: 'network-error', message, connectCode: extractConnectCode(error) }
   }

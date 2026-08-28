@@ -4,14 +4,13 @@
  * to the pinned catalog when no account can serve a live discovery call.
  */
 
-import type { DiscoveredModelEntry, DiscoveredModels } from '../types.js'
+import type { AppContext, DiscoveredModelEntry, DiscoveredModels } from '../types.js'
 import { AGY_PUBLIC_MODELS, isChatCallableModelId } from './catalog.js'
 import { fetchAvailableModels } from './client.js'
 import { ensureFreshAccessToken } from '../auth/tokens.js'
-import { ingestFamilyQuotas } from '../pool/quota.js'
-import type { AppContext } from '../api/chat-handler.js'
-import { createLogger } from '../util/log.js'
-import { familyKeyOf } from '../pool/quota.js'
+import { familyKeyOf, ingestFamilyQuotas } from '../util/quota.js'
+import { firstSuccessful } from '../util/concurrency.js'
+import { createLogger, errText } from '../util/log.js'
 
 const log = createLogger('discovery')
 
@@ -54,7 +53,7 @@ export async function discoverModels(ctx: AppContext): Promise<DiscoveryResult> 
     .filter((r) => r.enabled)
     .sort((a, b) => (b.cachedQuotaUpdatedAt ?? 0) - (a.cachedQuotaUpdatedAt ?? 0))
 
-  for (const record of accounts) {
+  const found = await firstSuccessful(accounts, async (record): Promise<DiscoveryResult | undefined> => {
     const cached = modelIdCache.get(record.email)
     if (cached && Date.now() - cached.updatedAt < MODEL_CACHE_TTL_MS) {
       return { ids: cached.ids, source: 'discovered', entries: cached.entries }
@@ -63,23 +62,22 @@ export async function discoverModels(ctx: AppContext): Promise<DiscoveryResult> 
       const discovered = await discoverForAccount(ctx, record.email, record.projectId)
       const entries = discovered.models ?? {}
       const ids = Object.keys(entries).filter(isChatCallableModelId)
-      if (ids.length > 0) {
-        const slot: CacheSlot = { ids, entries, updatedAt: Date.now() }
-        modelIdCache.set(record.email, slot)
-        return { ids, source: 'discovered', entries }
-      }
+      if (ids.length === 0) return undefined
+      modelIdCache.set(record.email, { ids, entries, updatedAt: Date.now() })
+      return { ids, source: 'discovered', entries }
     } catch (error) {
-      log.warn(
-        `model discovery failed for ${record.email}: ${error instanceof Error ? error.message : String(error)}; trying next account`,
-      )
+      log.warn(`model discovery failed for ${record.email}: ${errText(error)}; trying next account`)
+      return undefined
     }
-  }
+  })
 
-  return {
-    ids: AGY_PUBLIC_MODELS.map((m) => m.id),
-    source: 'catalog',
-    entries: {},
-  }
+  return (
+    found ?? {
+      ids: AGY_PUBLIC_MODELS.map((m) => m.id),
+      source: 'catalog',
+      entries: {},
+    }
+  )
 }
 
 /**

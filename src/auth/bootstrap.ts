@@ -10,6 +10,7 @@
 import { AGY_ENDPOINT_FALLBACKS } from '../upstream/endpoints.js'
 import { getBootstrapUserAgent, getClientMetadataHeader } from '../upstream/fingerprint.js'
 import { safeFetch } from '../util/urlguard.js'
+import { firstSuccessful, sleep } from '../util/concurrency.js'
 import { createLogger } from '../util/log.js'
 
 const log = createLogger('bootstrap')
@@ -70,14 +71,6 @@ function bootstrapHeaders(accessToken: string): Record<string, string> {
   }
 }
 
-async function fetchJson(url: string, init: RequestInit, proxyUrl?: string): Promise<Response> {
-  return safeFetch(url, {
-    ...init,
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    ...(proxyUrl ? { agyProxy: proxyUrl } : {}),
-  })
-}
-
 export interface BootstrapResult {
   projectId: string
   tierId: string
@@ -86,33 +79,32 @@ export interface BootstrapResult {
 /** Resolve project + tier via loadCodeAssist across fallback endpoints. */
 export async function loadCodeAssist(accessToken: string, proxyUrl?: string): Promise<BootstrapResult> {
   const headers = bootstrapHeaders(accessToken)
-  for (const base of AGY_ENDPOINT_FALLBACKS) {
+  const body = JSON.stringify({ metadata: bootstrapMetadata() })
+  const result = await firstSuccessful(AGY_ENDPOINT_FALLBACKS, async (base) => {
     try {
-      const response = await fetchJson(
-        `${base}/v1internal:loadCodeAssist`,
-        {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ metadata: bootstrapMetadata() }),
-        },
-        proxyUrl,
-      )
-      if (!response.ok) continue
+      const response = await safeFetch(`${base}/v1internal:loadCodeAssist`, {
+        method: 'POST',
+        headers,
+        body,
+        timeoutMs: FETCH_TIMEOUT_MS,
+        ...(proxyUrl ? { agyProxy: proxyUrl } : {}),
+      })
+      if (!response.ok) return undefined
       const data = (await response.json()) as CodeAssistData
       const projectId = extractProjectId(data)
-      if (projectId) {
-        return { projectId, tierId: extractOnboardTierId(data.subscriptionInfo) }
-      }
+      if (!projectId) return undefined
+      return { projectId, tierId: extractOnboardTierId(data.subscriptionInfo) }
     } catch {
-      // try the next endpoint
+      return undefined // try the next endpoint
     }
-  }
-  return { projectId: '', tierId: 'legacy-tier' }
+  })
+  return result ?? { projectId: '', tierId: 'legacy-tier' }
 }
 
 /**
  * Onboard an account without a Cloud Code project, then retry discovery.
- * Bounded: 3 attempts with a 3–7s jittered delay.
+ * Bounded: 3 attempts, each after a fresh 3–7s jittered delay (a fixed
+ * interval reads as scripted automation upstream).
  */
 export async function onboardAndDiscoverProject(
   accessToken: string,
@@ -120,33 +112,31 @@ export async function onboardAndDiscoverProject(
   proxyUrl?: string,
 ): Promise<BootstrapResult> {
   const headers = bootstrapHeaders(accessToken)
-  const metadata = bootstrapMetadata()
+  const body = JSON.stringify({ tier_id: tierId, metadata: bootstrapMetadata() })
   const maxAttempts = 3
-  const retryDelayMs = 3000 + Math.floor(Math.random() * 4000)
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      for (const base of AGY_ENDPOINT_FALLBACKS) {
-        const response = await fetchJson(
-          `${base}/v1internal:onboardUser`,
-          {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ tier_id: tierId, metadata }),
-          },
-          proxyUrl,
-        )
-        if (!response.ok) continue
+    const retryDelayMs = 3000 + Math.floor(Math.random() * 4000)
+    const discovered = await firstSuccessful(AGY_ENDPOINT_FALLBACKS, async (base) => {
+      try {
+        const response = await safeFetch(`${base}/v1internal:onboardUser`, {
+          method: 'POST',
+          headers,
+          body,
+          timeoutMs: FETCH_TIMEOUT_MS,
+          ...(proxyUrl ? { agyProxy: proxyUrl } : {}),
+        })
+        if (!response.ok) return undefined
         const result = (await response.json()) as { done?: boolean }
-        if (result.done === true) {
-          const discovered = await loadCodeAssist(accessToken, proxyUrl)
-          if (discovered.projectId) return discovered
-        }
+        if (result.done !== true) return undefined
+        const found = await loadCodeAssist(accessToken, proxyUrl)
+        return found.projectId ? found : undefined
+      } catch {
+        return undefined // transient — retried after the jittered delay
       }
-    } catch {
-      // transient — retry after delay
-    }
-    await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
+    })
+    if (discovered) return discovered
+    if (attempt < maxAttempts - 1) await sleep(retryDelayMs)
   }
   log.warn('onboarding did not complete within bounded attempts')
   return { projectId: '', tierId }

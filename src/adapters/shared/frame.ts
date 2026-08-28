@@ -5,6 +5,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { unwrapResponseEnvelope } from '../../upstream/envelope.js'
 import { rememberSignature } from './thinking.js'
 import type {
   UpstreamCandidate,
@@ -43,15 +44,6 @@ interface RawStreamChunk {
   error?: unknown
   candidates?: UpstreamCandidate[]
   usageMetadata?: UsageMetadata
-}
-
-/** Strip the upstream `{response: …}` wrapper if present (shared with client.ts). */
-export function unwrapResponseEnvelope<T>(raw: T): T {
-  if (raw && typeof raw === 'object') {
-    const inner = (raw as Partial<Record<'response', T>>).response
-    if (inner !== undefined) return inner
-  }
-  return raw
 }
 
 function extractErrorMessage(raw: unknown): string | undefined {

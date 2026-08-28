@@ -7,6 +7,8 @@
  * with AGY_MIN_INTERVAL_MS (0 = off).
  */
 
+import { sleep } from './concurrency.js'
+
 const DEFAULT_MIN_INTERVAL_MS = 300
 
 function resolveMinInterval(): number {
@@ -21,10 +23,6 @@ function resolveMinInterval(): number {
 export const MIN_INTERVAL_MS = resolveMinInterval()
 
 let lastStartAt = 0
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
 
 /**
  * Reserve the next start slot and wait until it arrives. Slots are allocated

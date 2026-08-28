@@ -1,12 +1,18 @@
 /**
  * Model-family quota accounting: family mapping, aggregation of
  * fetchAvailableModels quotaInfo per family, staleness TTLs.
+ *
+ * Lives in util/ (not pool/) because upstream discovery ingests family quotas
+ * at the source; pool scheduling (selector/ratelimit) consumes the same
+ * pure functions without creating an upstream→pool dependency.
  */
 
-import { SOFT_QUOTA_THRESHOLD } from './ratelimit.js'
 import type { AccountRecord, CachedQuota, DiscoveredModels } from '../types.js'
 
 export type ModelFamily = 'google' | 'anthropic' | 'openai'
+
+/** Below this remaining fraction the family counts as soft-quota-exhausted. */
+export const SOFT_QUOTA_THRESHOLD = 0.15
 
 /** Bucket for ids with no recognizable prefix. */
 export const FAMILY_UNKNOWN = 'unknown'
