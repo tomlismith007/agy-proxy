@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Local Antigravity reverse proxy: OAuth login, model discovery, OpenAI & Anthropic compatible APIs",
   "type": "module",
+  "workspaces": [
+    "admin-ui"
+  ],
   "engines": {
     "node": ">=22"
   },
